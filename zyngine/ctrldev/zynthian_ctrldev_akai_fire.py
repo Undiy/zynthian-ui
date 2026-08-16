@@ -312,6 +312,17 @@ class ZynpotRotate:
         self._knobs_ease.reset(ccnum)
 
 
+def _select_knob_arrow(state_manager, ccval):
+    """Select knob rotate -> ARROW_LEFT/RIGHT, the default left/right
+    list-navigation any mode falls back to when it has no more specific use
+    for the Select knob (currently DeviceHandler and ZynpadHandler;
+    MixerHandler keeps its own specialized raw chain-scroll instead - see
+    its cc_change). Select's own encoder isn't noisy like the other 4, so
+    no jitter filter here either - same as MixerHandler's."""
+    delta = ccval if ccval < 64 else ccval - 128
+    state_manager.send_cuia("ARROW_RIGHT" if delta > 0 else "ARROW_LEFT")
+
+
 # --------------------------------------------------------------------------
 # Handle GUI (generic screen navigation, active outside the audio mixer)
 # --------------------------------------------------------------------------
@@ -475,6 +486,10 @@ class DeviceHandler(ModeHandlerBase):
             self._state_manager.send_cuia("BACK")
         elif note == PAD_SELECT:
             self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
+        elif note == BTN_SELECT_PRESS:
+            # Same action as PAD_SELECT above - the physical Select knob's
+            # own push is just a second way to reach it.
+            self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
         elif note == PAD_UP:
             self._state_manager.send_cuia("ARROW_UP")
         elif note == PAD_DOWN:
@@ -494,6 +509,9 @@ class DeviceHandler(ModeHandlerBase):
         self._btn_timer.is_released(note)
 
     def cc_change(self, ccnum, ccval):
+        if ccnum == KNOB_SELECT:
+            _select_knob_arrow(self._state_manager, ccval)
+            return True
         return self._zynpot.cc_change(ccnum, ccval)
 
     def _handle_timed_button(self, btn, press_type):
@@ -1043,6 +1061,9 @@ class ZynpadHandler(ModeHandlerBase):
         if note in ZYNPOT_KNOBS:
             self._zynpot.reset(note)
             return True
+        if note == BTN_SELECT_PRESS:
+            self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
+            return True
 
         index = note - PAD_NOTE_BASE
         row, col = index // 16, index % 16
@@ -1054,6 +1075,9 @@ class ZynpadHandler(ModeHandlerBase):
         return True
 
     def cc_change(self, ccnum, ccval):
+        if ccnum == KNOB_SELECT:
+            _select_knob_arrow(self._state_manager, ccval)
+            return True
         return self._zynpot.cc_change(ccnum, ccval)
 
 
@@ -1081,10 +1105,14 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         self._is_alt = False
         self._btn_timer = ButtonTimer(self._handle_timed_button)
 
-        # Device mode is normally picked automatically from the current screen
-        # (see _update_current_handler), but Alt+Browser can force it on
-        # regardless of screen - see midi_event's BTN_BROWSER handling.
-        self._forced_device_mode = False
+        # The active mode is normally picked automatically from the current
+        # screen (see _update_current_handler), but Alt+Browser can unlink
+        # it - see midi_event's BTN_BROWSER handling - so it stays on
+        # whatever mode is currently showing regardless of screen changes
+        # (e.g. keep Mixer on the Fire while navigating the touchscreen to
+        # the pattern editor). Re-linking immediately re-syncs to the
+        # current screen.
+        self._screen_linked = True
         self._last_screen = None
 
         self._signals = [
@@ -1123,8 +1151,10 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         self._update_mode_leds()
 
     def _update_mode_leds(self):
-        # Browser (red-only): lit whenever Device mode is active.
-        self._leds.led_on(LED_BROWSER, LED_RED_HIGH) if self._current_handler is self._device_handler \
+        # Browser (red-only): repurposed as a screen-link indicator - lit
+        # whenever unlinked, as a reminder the Fire's mode won't follow
+        # screen changes until Alt+Browser re-links it.
+        self._leds.led_on(LED_BROWSER, LED_RED_HIGH) if not self._screen_linked \
             else self._leds.led_off(LED_BROWSER)
 
         # Perform (yellow-red): red in Mixer mode, yellow in Zynpad mode, off
@@ -1153,22 +1183,43 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 return True
             if note == BTN_ALT:
                 self._is_alt = True
-                # Alt+Browser (forced Device mode) works from any mode, so
-                # _is_alt itself is tracked unconditionally above - but only
-                # forward into MixerHandler (its Alt+Solo-N = toggle solo
-                # modifier) while it's actually the active mode.
+                # Alt+Browser (screen-link toggle) and Alt+Perform (jump to
+                # Device) work from any mode, so _is_alt itself is tracked
+                # unconditionally above - but only forward into MixerHandler
+                # (its Alt+Solo-N = toggle solo modifier) while it's
+                # actually the active mode.
                 if self._current_handler is self._mixer_handler:
                     self._mixer_handler.set_alt(True)
                 return True
             if note == BTN_PERFORM:
-                # Toggles between the two "performance" screens: from mixer,
-                # go to zynpad; from anywhere else (including Device mode's
-                # screens), go to mixer - so repeated presses settle into
-                # alternating mixer <-> zynpad.
-                if self._last_screen == "audio_mixer":
-                    self.state_manager.send_cuia("SCREEN_ZYNPAD")
+                if self._is_alt:
+                    # Straight to Device mode, unlinking if needed so it
+                    # sticks regardless of subsequent screen changes. Same
+                    # caveat as BTN_BROWSER above: _set_current_handler()
+                    # only refreshes LEDs on an actual handler change, so
+                    # the link-status LED needs an explicit update too.
+                    self._screen_linked = False
+                    self._set_current_handler(self._device_handler)
+                    self._update_mode_leds()
+                elif self._screen_linked:
+                    # Screen-driven: change the actual screen; screen-follow
+                    # (_update_current_handler) then updates the mode to
+                    # match. Toggles between the two "performance" screens:
+                    # from mixer, go to zynpad; from anywhere else
+                    # (including Device mode's screens), go to mixer - so
+                    # repeated presses settle into alternating mixer <->
+                    # zynpad.
+                    if self._last_screen == "audio_mixer":
+                        self.state_manager.send_cuia("SCREEN_ZYNPAD")
+                    else:
+                        self.state_manager.send_cuia("SCREEN_AUDIO_MIXER")
                 else:
-                    self.state_manager.send_cuia("SCREEN_AUDIO_MIXER")
+                    # Unlinked: flip the Fire's own mode directly, without
+                    # touching whatever's actually shown on the touchscreen -
+                    # same mixer <-> zynpad toggle, just applied straight to
+                    # the handler.
+                    target = self._zynpad_handler if self._current_handler is self._mixer_handler else self._mixer_handler
+                    self._set_current_handler(target)
                 return True
 
             # Transport, Browser and Bank/Mode are global: they work the same
@@ -1179,8 +1230,13 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 return True
             if note == BTN_BROWSER:
                 if self._is_alt:
-                    self._forced_device_mode = not self._forced_device_mode
+                    self._screen_linked = not self._screen_linked
+                    # _update_current_handler() only refreshes LEDs when the
+                    # handler itself changes - the link toggle needs its own
+                    # LED update even when it doesn't (e.g. toggling while
+                    # already on the mode the current screen would pick).
                     self._update_current_handler()
+                    self._update_mode_leds()
                 else:
                     # MENU is context-aware per current screen (zynthian_gui's
                     # cuia_menu calls the screen's own toggle_menu() if it has
@@ -1256,31 +1312,38 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             else:
                 self.state_manager.send_cuia("STOP")
 
+    def _set_current_handler(self, handler):
+        """Switch to the given handler (no-op if it's already current),
+        refreshing its pad state and the mode LEDs."""
+        if self._current_handler is handler:
+            return
+        self._current_handler = handler
+        if handler is self._mixer_handler:
+            # Pick up Alt if it was already held before switching in (its
+            # press/release edges only forward to MixerHandler while it's
+            # already the active mode - see BTN_ALT handling).
+            self._mixer_handler.set_alt(self._is_alt)
+        # Unconditional full clear rather than each handler tracking which
+        # notes the *other* one used - simpler, and can't miss anything as
+        # more pad-owning modes are added.
+        self._pads.all_off()
+        self._current_handler.refresh()
+        self._update_mode_leds()
+
     def _update_current_handler(self):
-        """Re-derive _current_handler from _forced_device_mode + _last_screen,
-        and refresh it if it just changed. Called on screen changes and on the
-        Alt+Browser forced-mode toggle."""
-        old_handler = self._current_handler
-        if self._forced_device_mode:
-            self._current_handler = self._device_handler
-        elif self._last_screen == "audio_mixer":
-            self._current_handler = self._mixer_handler
+        """While screen-linked, re-derive _current_handler from
+        _last_screen. While unlinked, do nothing - _current_handler stays
+        exactly as-is regardless of screen changes, until re-linked (which
+        immediately re-syncs to whatever screen is current at that point).
+        Called on screen changes and on the Alt+Browser link toggle."""
+        if not self._screen_linked:
+            return
+        if self._last_screen == "audio_mixer":
+            self._set_current_handler(self._mixer_handler)
         elif self._last_screen == "zynpad":
-            self._current_handler = self._zynpad_handler
+            self._set_current_handler(self._zynpad_handler)
         else:
-            self._current_handler = self._device_handler
-        if old_handler is not self._current_handler:
-            if self._current_handler is self._mixer_handler:
-                # Pick up Alt if it was already held before switching in (its
-                # press/release edges only forward to MixerHandler while it's
-                # already the active mode - see BTN_ALT handling).
-                self._mixer_handler.set_alt(self._is_alt)
-            # Unconditional full clear rather than each handler tracking which
-            # notes the *other* one used - simpler, and can't miss anything as
-            # more pad-owning modes are added.
-            self._pads.all_off()
-            self._current_handler.refresh()
-            self._update_mode_leds()
+            self._set_current_handler(self._device_handler)
 
     def _on_gui_show_screen(self, screen, **kwargs):
         self._last_screen = screen
