@@ -1669,11 +1669,22 @@ class StepSeqHandler(ModeHandlerBase):
 # --------------------------------------------------------------------------
 #
 # v1, deliberately minimal (more from the DrivenByMoss manual excerpt this
-# was modeled on - scale/chromatic toggle, Piano mode, Accent, quantize - is
-# left for later): the whole grid is one contiguous 64-note chromatic
-# keyboard (no scale constraint), octave-shiftable via the Select knob.
-# Pressing a pad plays that note on the currently active chain for as long
-# as it's held, at the velocity the pad itself reports.
+# was modeled on - scale/chromatic toggle, Accent, quantize - is left for
+# later): two layouts, toggled by pressing BTN_NOTE again while already in
+# Play mode (DrivenByMoss's own convention is a double-press within a short
+# window; this driver has no double-press infra elsewhere, and "press again
+# while active" is simpler, needs no timing/threshold, and gives BTN_NOTE a
+# reason to do something when Play mode is already up, where before it did
+# nothing) - see toggle_layout(). Chromatic (the default on every fresh
+# activation): the whole grid is one contiguous 64-note run, no scale
+# constraint. Piano: two independent 2-octave-apart "bands" (rows 0-1 =
+# higher, rows 2-3 = lower), each a real white-key-row/black-key-row piano
+# layout (DrivenByMoss's actual Piano View, not just "no scale applied" -
+# our chromatic mode already has no scale, so that's not what
+# distinguishes them here). Both octave-shift via the same Select
+# knob/self._base_note. Pressing a pad plays that note on the currently
+# active chain for as long as it's held, at the velocity the pad itself
+# reports.
 #
 # Getting a live note to actually reach an engine turned out to need real
 # JACK-level MIDI I/O, not any Python/ctypes call - see the driver's own
@@ -1736,6 +1747,17 @@ class PlayHandler(ModeHandlerBase):
     COLOR_OCTAVE = (0, 0, 70)
     COLOR_PLAYED = (0, 90, 0)
     COLOR_RECORD = (90, 0, 0)
+    # Piano layout only: black keys get their own color (DrivenByMoss uses
+    # "the selected track's color" - we have no such concept here, so a
+    # fixed, visually-distinct hue instead).
+    COLOR_BLACK_KEY = (40, 0, 40)
+
+    # Piano layout: standard 7-white-key/5-black-key octave, black key
+    # "after" white column index c exists unless c%7 is E (2) or B (6) -
+    # the two places a real keyboard has no black key at all.
+    PIANO_WHITE_OFFSETS = (0, 2, 4, 5, 7, 9, 11)   # C D E F G A B
+    PIANO_NO_BLACK_AFTER = (2, 6)                  # E, B
+    PIANO_BAND_OFFSET = 24  # semitones between the two bands (2 octaves)
 
     def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs, notes_queue: mp.Queue):
         super().__init__(state_manager)
@@ -1745,6 +1767,7 @@ class PlayHandler(ModeHandlerBase):
         self._zynpot = ZynpotRotate(state_manager)
         self._base_note = self.BASE_NOTE_DEFAULT
         self._octave_step = 0   # -MAX_OCTAVE_STEPS..+MAX_OCTAVE_STEPS, see _shift_octave
+        self._chromatic = True  # False = Piano layout, see toggle_layout()
         self._play_chan = _resolve_play_midi_chan()  # refreshed in set_active(True) too
         # Pad note -> (midi note, channel) actually sounding for it - both
         # fixed at press time and reused as-is on release/panic, rather than
@@ -1760,6 +1783,7 @@ class PlayHandler(ModeHandlerBase):
     def set_active(self, active):
         super().set_active(active)
         if active:
+            self._chromatic = True  # every fresh activation starts in Play (chromatic)
             self._play_chan = _resolve_play_midi_chan()
         else:
             # Notes are sustained (duration=0) until explicitly stopped -
@@ -1767,8 +1791,36 @@ class PlayHandler(ModeHandlerBase):
             # them stuck on forever.
             self._all_notes_off()
 
+    def toggle_layout(self):
+        """BTN_NOTE pressed again while Play mode is already active (see
+        midi_event's BTN_NOTE handling) - switches between Chromatic and
+        Piano. Flushes held notes first, same reasoning as _shift_octave:
+        the pad->note mapping is about to change completely."""
+        self._all_notes_off()
+        self._chromatic = not self._chromatic
+        self.refresh()
+
     def _midi_note(self, row, col):
-        return self._base_note + (3 - row) * 16 + col
+        if self._chromatic:
+            return self._base_note + (3 - row) * 16 + col
+        return self._piano_note(row, col)
+
+    def _piano_note(self, row, col):
+        """Piano layout: rows 0-1 are the higher band (0=black key row,
+        1=white key row), rows 2-3 the lower band (self.PIANO_BAND_OFFSET
+        semitones down) laid out the same way - see the class comment and
+        PIANO_WHITE_OFFSETS/PIANO_NO_BLACK_AFTER. Returns None for a
+        "no black key here" gap (e.g. between E and F), same as an
+        out-of-MIDI-range note - both mean "this pad plays nothing"."""
+        band_base = self._base_note if row < 2 else self._base_note - self.PIANO_BAND_OFFSET
+        is_black_row = row in (0, 2)
+        octave, deg = divmod(col, 7)
+        white_note = band_base + octave * 12 + self.PIANO_WHITE_OFFSETS[deg]
+        if not is_black_row:
+            return white_note
+        if deg in self.PIANO_NO_BLACK_AFTER:
+            return None
+        return white_note + 1
 
     def _active_channel(self):
         """self._play_chan if there's a chain that can actually take notes
@@ -1790,13 +1842,15 @@ class PlayHandler(ModeHandlerBase):
     def _paint_pad(self, row, col, pressed=False):
         note_pad = _pad(row, col)
         note_val = self._midi_note(row, col)
-        if not (0 <= note_val <= 127):
+        if note_val is None or not (0 <= note_val <= 127):
             self._pads.pad_off(note_pad)
             return
         if pressed:
             color = self.COLOR_RECORD if self._zynseq.libseq.isMidiRecord() else self.COLOR_PLAYED
         elif note_val % 12 == 0:
             color = self.COLOR_OCTAVE
+        elif not self._chromatic and row in (0, 2):
+            color = self.COLOR_BLACK_KEY
         else:
             color = self.COLOR_NOTE
         self._pads.set_pad(note_pad, *color)
@@ -1897,7 +1951,7 @@ class PlayHandler(ModeHandlerBase):
             idx = note - PAD_NOTE_BASE
             row, col = idx // 16, idx % 16
             note_val = self._midi_note(row, col)
-            if not (0 <= note_val <= 127):
+            if note_val is None or not (0 <= note_val <= 127):
                 return True
             channel = self._active_channel()
             self._held[note] = (note_val, channel)
@@ -2199,13 +2253,18 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 self.state_manager.send_cuia("SCREEN_PATTERN_EDITOR")
                 return True
             if note == BTN_NOTE:
-                # Unlike the other modes, Play has no screen of its own to be
-                # screen-linked to - force it on directly and unlink, same as
-                # Alt+Perform does for Device mode, so it sticks regardless
-                # of the touchscreen.
-                self._screen_linked = False
-                self._set_current_handler(self._play_handler)
-                self._update_mode_leds()
+                if self._current_handler is self._play_handler:
+                    # Already active - a second press cycles the layout
+                    # (Chromatic <-> Piano) instead of doing nothing.
+                    self._play_handler.toggle_layout()
+                else:
+                    # Unlike the other modes, Play has no screen of its own
+                    # to be screen-linked to - force it on directly and
+                    # unlink, same as Alt+Perform does for Device mode, so
+                    # it sticks regardless of the touchscreen.
+                    self._screen_linked = False
+                    self._set_current_handler(self._play_handler)
+                    self._update_mode_leds()
                 return True
             if note == BTN_PERFORM:
                 if self._is_alt:
