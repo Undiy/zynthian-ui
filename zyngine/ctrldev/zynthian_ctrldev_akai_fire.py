@@ -27,22 +27,30 @@
 # engineered MIDI/SysEx protocol this driver is based on, including what is
 # solid vs. what still needs confirming against real hardware.
 #
-# This first version implements three modes, auto-switched by the current
-# zynthian screen: "Device" (generic V5 4-knob navigation plus a full pad-grid
-# button matrix - the fallback for any screen not covered by another mode, or
-# forced on via Alt+Browser regardless of screen), "Mixer" (audio_mixer
-# screen), and "Zynpad" (zynpad screen - sequence/clip launcher on the pad
-# grid). The OLED is intentionally untouched for now. Step/Note/Drum are
-# unbound, reserved for future modes (step-sequencer, note-pads, drum view).
+# This first version implements five modes. Four are auto-switched by the
+# current zynthian screen: "Device" (generic V5 4-knob navigation plus a full
+# pad-grid button matrix - the fallback for any screen not covered by another
+# mode, or forced on via Alt+Browser regardless of screen), "Mixer"
+# (audio_mixer screen), "Zynpad" (zynpad screen - sequence/clip launcher on
+# the pad grid), and "StepSeq" (pattern_editor screen, reached via BTN_STEP -
+# a Note Sequencer style step editor on the pad grid, see
+# zynthian_ctrldev_akai_fire_stepseq_plan.md for the design this implements).
+# The fifth, "Play" (reached via BTN_NOTE - a chromatic note-playing keyboard
+# on the pad grid), has no screen of its own and is forced on/off directly
+# instead. The OLED is intentionally untouched for now. Drum is unbound,
+# reserved for a future mode.
 #
 # ******************************************************************************
 
 import time
+import json
+import queue
 import logging
+import multiprocessing as mp
 
 from zynlibs.zynseq import zynseq
-from zyngine.ctrldev.zynthian_ctrldev_base import zynthian_ctrldev_zynmixer, zynthian_ctrldev_zynpad
-from zyngine.ctrldev.zynthian_ctrldev_base_extended import ButtonTimer, CONST
+from zyngine.ctrldev.zynthian_ctrldev_base import zynthian_ctrldev_base, zynthian_ctrldev_zynmixer, zynthian_ctrldev_zynpad
+from zyngine.ctrldev.zynthian_ctrldev_base_extended import ButtonTimer, CONST, IntervalTimer
 from zyngine.ctrldev.zynthian_ctrldev_base_ui import ModeHandlerBase
 from zyngine.zynthian_signal_manager import zynsigman
 from zyncoder.zyncore import lib_zyncore
@@ -75,8 +83,8 @@ BTN_SOLO_1 = 0x24
 BTN_SOLO_2 = 0x25
 BTN_SOLO_3 = 0x26
 BTN_SOLO_4 = 0x27
-BTN_STEP = 0x2C		# unbound for now, reserved for a future step-sequencer mode
-BTN_NOTE = 0x2D		# unbound for now, reserved for a future note-pad mode
+BTN_STEP = 0x2C		# activates StepSeq mode (see StepSeqHandler)
+BTN_NOTE = 0x2D		# activates Play mode (see PlayHandler)
 BTN_DRUM = 0x2E		# unbound for now, reserved for a future drum mode
 BTN_PERFORM = 0x2F		# toggles between the Mixer and Zynpad screens
 BTN_SHIFT = 0x30
@@ -101,6 +109,41 @@ ZYNPOT_KNOBS = {
     KNOB_FILTER: 2,
     KNOB_RESONANCE: 3,
 }
+
+# MIDI channel (0-indexed) reserved for PlayHandler's live-played notes,
+# injected via the driver's midiproc_task - see that method and
+# PlayHandler._send_note() for the full story. Distinct from Fire's own raw
+# input, always channel 0 (buttons/pads) - see unroute_from_chains below,
+# which keeps channel 0 out of chain routing while leaving this one (and
+# every other channel) open. Combined with ACTI mode (zmip_set_flag_active_
+# chain, set in the driver's init()), any note sent on this channel routes
+# to whichever chain is currently active, regardless of that chain's own
+# configured MIDI channel - so the exact value here doesn't matter beyond
+# "not 0" - EXCEPT it also must avoid zynthian_gui_config.master_midi_channel
+# (a completely separate feature - a channel whose incoming notes
+# zynthian_state_manager.zynmidi_read() intercepts and maps through
+# master_midi_note_cuia straight into CUIA actions, e.g. screen changes,
+# transport, recording - confirmed the hard way: every played note here
+# triggered a random CUIA when this collided with it). See
+# _resolve_play_midi_chan(), which picks around it dynamically rather than
+# risk this constant silently colliding with that (env-var-configured,
+# so not knowable at import time) channel.
+PLAY_MIDI_CHAN = 1
+
+
+def _resolve_play_midi_chan():
+    """PLAY_MIDI_CHAN, unless it collides with master_midi_channel (see
+    PLAY_MIDI_CHAN's own comment) - in which case, the first channel in
+    1..15 that collides with neither that nor Fire's own raw channel (0).
+    Called fresh each time PlayHandler activates, not just once, in case
+    the master channel setting changes while zynthian is running."""
+    avoid = {0, zynthian_gui_config.master_midi_channel}
+    if PLAY_MIDI_CHAN not in avoid:
+        return PLAY_MIDI_CHAN
+    for chan in range(1, 16):
+        if chan not in avoid:
+            return chan
+    return PLAY_MIDI_CHAN  # unreachable in practice - would need 15 channels all reserved
 
 # Output-only LED addresses (channel 0, CC message; value = color, see below)
 # For "plain" buttons, LED feedback is CC == the button's own note number.
@@ -185,8 +228,20 @@ def _alt_mode():
     so it can't go stale if toggled some other way than through this driver.
     NOT the same thing as momentarily holding Fire's own physical Alt button
     (BTN_ALT) - that's a separate, unrelated modifier (see e.g. Alt+Solo-N in
-    MixerHandler)."""
-    return zynthian_gui_config.zyngui.get_alt_mode()
+    MixerHandler). zyngui can still be None here: driver loading is
+    triggered synchronously off midi_autoconnect's device-connect callback,
+    which can run before the GUI singleton exists yet - a first refresh()
+    reaching this (observed via zynpad.init()'s zynsigman.register_queued()
+    apparently replaying an already-queued SS_SEQ_REFRESH straight into the
+    new subscriber) would otherwise crash driver.init() with
+    'NoneType' object has no attribute 'get_alt_mode', aborting the load -
+    which, worse, leaves an orphaned midiproc subprocess behind (it's spawned
+    earlier in init(), so it's already running by the time this would crash)
+    that wins the JACK client name and gets autoconnected, while the actual
+    successfully-loaded retry's own midiproc silently never gets wired up at
+    all. Default to alt mode off rather than propagate the crash."""
+    zyngui = zynthian_gui_config.zyngui
+    return zyngui.get_alt_mode() if zyngui is not None else False
 
 
 def _toggle_alt_mode():
@@ -196,7 +251,9 @@ def _toggle_alt_mode():
     still read the pre-toggle value. zynthian_gui.cuia_toggle_alt_mode() is a
     pure attribute flip with no other side effects, so this reproduces it
     exactly, just synchronously - callers can safely repaint right after."""
-    zynthian_gui_config.zyngui.alt_mode = not _alt_mode()
+    zyngui = zynthian_gui_config.zyngui
+    if zyngui is not None:
+        zyngui.alt_mode = not _alt_mode()
 
 
 # --------------------------------------------------------------------------
@@ -1058,6 +1115,8 @@ class ZynpadHandler(ModeHandlerBase):
         self._pads.set_pad(_pad(row, col), *self._state_color(state, seq, group))
 
     def note_on(self, note, velocity, shifted_override=None):
+        self._on_shifted_override(shifted_override)
+
         if note in ZYNPOT_KNOBS:
             self._zynpot.reset(note)
             return True
@@ -1071,12 +1130,799 @@ class ZynpadHandler(ModeHandlerBase):
         if lcol >= self._zynseq.col_in_bank or lrow >= self._zynseq.col_in_bank:
             return False
         seq = self._zynseq.get_pad_from_xy(lcol, lrow)
+
+        if self._is_shifted:
+            # Shift+Pad opens StepSeq directly on that pad's pattern, same
+            # shortcut as the APC key25 mk2 driver's own "SHIFT + PAD ->
+            # StepSeq". Screen-driven like BTN_STEP (see midi_event): selects
+            # the pad, then lets SCREEN_PATTERN_EDITOR (which reads zynpad's
+            # now-updated selected_pad) and screen-follow take it from there
+            # - so this only actually lands on StepSeq while screen-linked,
+            # consistent with every other mode switch in this driver.
+            self._select_pad(seq)
+            self._state_manager.send_cuia("SCREEN_PATTERN_EDITOR")
+            return True
+
         self._libseq.togglePlayState(self._zynseq.bank, seq)
         return True
 
     def cc_change(self, ccnum, ccval):
         if ccnum == KNOB_SELECT:
             _select_knob_arrow(self._state_manager, ccval)
+            return True
+        return self._zynpot.cc_change(ccnum, ccval)
+
+
+# zynseq keymaps live here on a real box (see zynthian_gui_patterneditor.py's
+# own CONFIG_ROOT) - not present in this bare checkout (CLAUDE.md).
+ZYNSEQ_CONFIG_ROOT = "/zynthian/zynthian-data/zynseq"
+
+
+# --------------------------------------------------------------------------
+# Handle StepSeq (Note Sequencer style step editor, active on the
+# pattern_editor screen, reached via BTN_STEP)
+# --------------------------------------------------------------------------
+#
+# See zynthian_ctrldev_akai_fire_stepseq_plan.md for the full design this
+# implements. Short version: pad grid is row=pitch (from a keymap built the
+# same way zynthian_gui_patterneditor.py's load_keymap() does - chromatic, or
+# a scales.json scale relative to the pattern's tonic; only 4 rows visible at
+# once, BTN_PAT_UP/DOWN scroll the window), col=step (only 16 visible at
+# once, Grid Left/Right page through the pattern). A pad press is a 4-way
+# gesture (see _on_grid_press/_on_grid_release): plain tap toggles the note;
+# holding past the long-press threshold toggles it in/out of
+# self._selected_notes (a purely local, UI-side "selection" - zynseq has no
+# such concept); pressing a second pad in the same row while the first is
+# still held is read as an extend-duration drag, matching the touchscreen's
+# own drag convention (duration = distance between the two steps). Knobs
+# then edit whatever's selected (or the last-tapped note, if selection is
+# empty) - see cc_change(). Play/Stop need no special-casing here: the
+# existing global TOGGLE_PLAY/STOP CUIAs already target this pattern's own
+# sequence whenever the "pattern_editor" screen is showing (see
+# zynthian_gui.cuia_toggle_audio_play/cuia_stop_audio_play), which is exactly
+# the screen this mode is active on.
+class StepSeqHandler(ModeHandlerBase):
+
+    DEFAULT_VELOCITY = 100
+    DEFAULT_DURATION = 1
+
+    # Note cell colors: full at a note's start step, dimmer across the rest
+    # of its sustain (its "tail") - selected notes get the plan's dark-yellow
+    # overlay instead of the normal teal, at both brightness levels.
+    COLOR_EMPTY = (0, 0, 0)
+    COLOR_NOTE = (0, 60, 60)
+    COLOR_NOTE_TAIL = (0, 20, 20)
+    COLOR_SELECTED = (70, 60, 0)
+    COLOR_SELECTED_TAIL = (35, 30, 0)
+
+    # Playhead cursor: an otherwise-empty cell at the current step gets a dim
+    # green tint (rather than staying black) so the column reads as "the
+    # cursor" even where there's no note; a cell that already has a note
+    # keeps its own color, just with more green mixed in, so the cursor is
+    # visible passing through without hiding note/selection state.
+    COLOR_PLAYHEAD_EMPTY = (0, 30, 0)
+    PLAYHEAD_GREEN_BOOST = 40
+    PLAYHEAD_POLL_MS = 200   # matches zynthian_gui's own status-refresh rate
+
+    def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs):
+        super().__init__(state_manager)
+        self._leds = leds
+        self._pads = pads
+        self._libseq = self._zynseq.libseq
+        self._knobs_ease = KnobJitterFilter()
+        self._is_alt = False
+
+        self._keymap = [{"note": n} for n in range(128)]
+        self._row_offset = 0    # index into _keymap of the topmost visible row
+        self._step_page = 0     # which 16-step page of the pattern is visible
+        self._steps = 16        # getSteps() of the current pattern, cached in refresh()
+
+        # (step, note) pairs - see class comment. _last_note is the fallback
+        # group-edit target when _selected_notes is empty (the most recently
+        # tapped-on or added note).
+        self._selected_notes = set()
+        self._last_note = None
+
+        # Pads currently physically held, note -> (row, col, step, note_val,
+        # press_ts) - used to tell a plain tap from a long-press (on release,
+        # by elapsed time) and to detect the second-pad-of-an-extend-gesture
+        # case (see _on_grid_press). A pad popped from here by that gesture
+        # is "consumed" - its own eventual release finds nothing and no-ops,
+        # same idea as DrivenByMoss's button.setConsumed().
+        self._held = {}
+
+        # Playhead cursor - absolute step index (matching self._step_page's
+        # domain) currently playing, or None while stopped/not visible.
+        # zynseq has no push signal for this (SS_SEQ_PROGRESS exists but
+        # nothing in this codebase actually emits it), so this is polled the
+        # same way zynthian_gui_patterneditor.py's own refresh_status() does
+        # it - via getPatternPlayhead() - just on our own timer instead of
+        # riding the GUI's status-refresh thread.
+        self._playhead_step = None
+        self._playhead_timer = IntervalTimer()
+
+    def set_alt(self, state):
+        # Momentary BTN_ALT, used as the Filter-knob modifier (Alt+Filter =
+        # play chance instead of stutter count) - see cc_change().
+        self._is_alt = state
+
+    # ----------------------------------------------------------------------
+    # Keymap / view
+    # ----------------------------------------------------------------------
+    def _load_keymap(self):
+        """Rebuild self._keymap from the current pattern's scale/tonic,
+        mirroring zynthian_gui_patterneditor.py's load_keymap() (chromatic,
+        or a scales.json scale) - custom .midnam keymaps and CC display mode
+        are out of scope here. Also re-centers the row view on middle C."""
+        scale = self._libseq.getScale()
+        tonic = self._libseq.getTonic()
+        keymap = []
+        if scale > 1:
+            try:
+                with open(ZYNSEQ_CONFIG_ROOT + "/scales.json") as f:
+                    data = json.load(f)
+                if scale <= len(data):
+                    entry = data[scale - 1]
+                    for octave in range(9):
+                        for offset in entry["scale"]:
+                            note = tonic + offset + octave * 12
+                            if note > 127:
+                                break
+                            keymap.append({"note": note})
+            except Exception as ex:
+                logging.warning(f"StepSeqHandler: can't load scales.json => {ex}")
+        if not keymap:
+            keymap = [{"note": n} for n in range(128)]
+        self._keymap = keymap
+
+        idx = next((i for i, e in enumerate(keymap) if e["note"] >= 60), 0)
+        self._row_offset = max(0, min(idx - 1, len(keymap) - 4))
+
+    def _keymap_index(self, phys_row):
+        """Physical pad row (0=top) -> index into self._keymap, or None if
+        that row is past either edge of the keymap right now."""
+        idx = self._row_offset + (3 - phys_row)
+        return idx if 0 <= idx < len(self._keymap) else None
+
+    def _pad_for(self, step, note_val):
+        """Inverse lookup: (step, note) -> (phys_row, phys_col) if currently
+        visible, else None. Linear scan over the keymap - fine at
+        button-press rates, not called anywhere hot."""
+        col = step - self._step_page * 16
+        if not (0 <= col < 16):
+            return None
+        idx = next((i for i, e in enumerate(self._keymap) if e["note"] == note_val), None)
+        if idx is None:
+            return None
+        row = self._row_offset + 3 - idx
+        return (row, col) if 0 <= row < 4 else None
+
+    def _page_steps(self, direction):
+        max_page = max(0, (self._steps - 1) // 16)
+        self._step_page = max(0, min(self._step_page + direction, max_page))
+        self._paint_all()
+
+    def _scroll_rows(self, direction):
+        max_offset = max(0, len(self._keymap) - 4)
+        self._row_offset = max(0, min(self._row_offset + direction, max_offset))
+        self._paint_all()
+
+    # ----------------------------------------------------------------------
+    # Painting
+    # ----------------------------------------------------------------------
+    def set_active(self, active):
+        super().set_active(active)
+        if active:
+            self._playhead_timer.add("playhead", self.PLAYHEAD_POLL_MS, self._poll_playhead)
+        else:
+            self._playhead_timer.remove("playhead")
+
+    def refresh(self):
+        self._load_keymap()
+        self._steps = self._libseq.getSteps()
+        self._step_page = 0
+        self._selected_notes = set()
+        self._last_note = None
+        self._held = {}
+        self._playhead_step = None
+        self._paint_all()
+        self._update_leds()
+
+    def _paint_all(self):
+        for row in range(4):
+            for col in range(16):
+                self._paint_pad(row, col)
+
+    def _paint_column(self, step):
+        col = step - self._step_page * 16
+        if 0 <= col < 16:
+            for row in range(4):
+                self._paint_pad(row, col)
+
+    def _poll_playhead(self, name):
+        seq = self._get_selected_sequence()
+        new_step = None
+        if seq is not None:
+            state = self._libseq.getPlayState(self._zynseq.bank, seq)
+            if state in (zynseq.SEQ_PLAYING, zynseq.SEQ_STARTING, zynseq.SEQ_RESTARTING):
+                new_step = self._libseq.getPatternPlayhead()
+        if new_step == self._playhead_step:
+            return
+        old_step = self._playhead_step
+        self._playhead_step = new_step
+        # Only repaint the columns that actually changed - a full-grid
+        # repaint every tick would be needless SysEx traffic.
+        if old_step is not None:
+            self._paint_column(old_step)
+        if new_step is not None:
+            self._paint_column(new_step)
+
+    def _paint_pad(self, row, col):
+        note_pad = _pad(row, col)
+        step = self._step_page * 16 + col
+        idx = self._keymap_index(row)
+        if idx is None or step >= self._steps:
+            self._pads.pad_off(note_pad)
+            return
+        note_val = self._keymap[idx]["note"]
+        start = self._libseq.getNoteStart(step, note_val)
+        on_playhead = step == self._playhead_step
+        if start < 0:
+            color = self.COLOR_PLAYHEAD_EMPTY if on_playhead else self.COLOR_EMPTY
+            self._pads.set_pad(note_pad, *color)
+            return
+        selected = (start, note_val) in self._selected_notes
+        if step == start:
+            color = self.COLOR_SELECTED if selected else self.COLOR_NOTE
+        else:
+            color = self.COLOR_SELECTED_TAIL if selected else self.COLOR_NOTE_TAIL
+        if on_playhead:
+            r, g, b = color
+            color = (r, min(127, g + self.PLAYHEAD_GREEN_BOOST), b)
+        self._pads.set_pad(note_pad, *color)
+
+    def _paint_pad_at(self, step, note_val):
+        pos = self._pad_for(step, note_val)
+        if pos is not None:
+            self._paint_pad(*pos)
+
+    def _update_leds(self):
+        # Solo1 (Stop) is a momentary action with no state, so no LED for it.
+        self._leds.led_off(LED_SOLO_1)
+        chain = self._get_chain()
+        self._leds.led_on(LED_SOLO_2, LED_GREEN_HIGH) if chain is not None and self._zynmixer.get_mute(chain.mixer_chan) \
+            else self._leds.led_off(LED_SOLO_2)
+        self._leds.led_on(LED_SOLO_3, LED_GREEN_HIGH) if chain is not None and self._zynmixer.get_solo(chain.mixer_chan) \
+            else self._leds.led_off(LED_SOLO_3)
+        self._leds.led_on(LED_SOLO_4, LED_GREEN_HIGH) if self._libseq.getQuantizeNotes() \
+            else self._leds.led_off(LED_SOLO_4)
+
+    # ----------------------------------------------------------------------
+    # Note add/remove/select/extend - the pad-press state machine
+    # ----------------------------------------------------------------------
+    def _on_grid_press(self, note):
+        idx = note - PAD_NOTE_BASE
+        row, col = idx // 16, idx % 16
+        step = self._step_page * 16 + col
+        krow = self._keymap_index(row)
+        if krow is None or step >= self._steps:
+            return True
+        note_val = self._keymap[krow]["note"]
+
+        # A second pad in the same row, pressed while another is still held,
+        # is the extend-duration gesture - consumes both (see class comment).
+        other = next((n for n, info in self._held.items() if info[0] == row and n != note), None)
+        if other is not None:
+            self._extend_duration(self._held.pop(other), step, note_val)
+            return True
+
+        self._held[note] = (row, col, step, note_val, time.time())
+        return True
+
+    def _on_grid_release(self, note):
+        info = self._held.pop(note, None)
+        if info is None:
+            return  # consumed by an extend-duration gesture already
+        _, _, step, note_val, ts = info
+        if time.time() - ts >= CONST.PT_LONG_TIME:
+            self._toggle_selection(step, note_val)
+        else:
+            self._toggle_note(step, note_val)
+
+    def _extend_duration(self, start_info, end_step, note_val):
+        _, _, start_step, start_note_val, _ = start_info
+        if start_note_val != note_val or start_step == end_step:
+            return
+        lo, hi = sorted((start_step, end_step))
+        if self._libseq.getNoteStart(lo, note_val) != lo:
+            return  # nothing to extend - no note actually starts at lo
+        # Inclusive: the note should sustain through the second pad you
+        # pressed, not end right before it - unlike the touchscreen's own
+        # drag gesture (distance, not count), this is two discrete pad
+        # presses, so "extend to this pad" reads as "cover this step too".
+        self._set_note_duration(lo, note_val, hi - lo + 1)
+        self._paint_all()
+
+    def _toggle_note(self, step, note_val):
+        start = self._libseq.getNoteStart(step, note_val)
+        if start >= 0:
+            self._selected_notes.discard((start, note_val))
+            if self._last_note == (start, note_val):
+                self._last_note = None
+            self._libseq.removeNote(start, note_val)
+            self._paint_all()
+        else:
+            self._libseq.addNote(step, note_val, self.DEFAULT_VELOCITY, self.DEFAULT_DURATION, 0)
+            self._last_note = (step, note_val)
+            self._paint_pad_at(step, note_val)
+
+    def _toggle_selection(self, step, note_val):
+        start = self._libseq.getNoteStart(step, note_val)
+        if start < 0:
+            return  # long-pressing an empty cell is a no-op
+        key = (start, note_val)
+        if key in self._selected_notes:
+            self._selected_notes.discard(key)
+        else:
+            self._selected_notes.add(key)
+        self._paint_pad_at(start, note_val)
+
+    # ----------------------------------------------------------------------
+    # Group editing - applies to _selected_notes if non-empty, else to
+    # _last_note alone
+    # ----------------------------------------------------------------------
+    def _current_targets(self):
+        if self._selected_notes:
+            return set(self._selected_notes)
+        return {self._last_note} if self._last_note is not None else set()
+
+    def _adjust_velocity(self, delta):
+        for step, note_val in self._current_targets():
+            vel = self._libseq.getNoteVelocity(step, note_val)
+            if vel <= 0:
+                continue
+            self._libseq.setNoteVelocity(step, note_val, max(1, min(127, vel + delta)))
+        self._paint_all()
+
+    def _adjust_duration(self, delta):
+        for step, note_val in self._current_targets():
+            dur = self._libseq.getNoteDuration(step, note_val)
+            if dur <= 0:
+                continue
+            self._set_note_duration(step, note_val, max(1, min(self._steps, dur + delta)))
+        self._paint_all()
+
+    def _adjust_stutter_count(self, delta):
+        for step, note_val in self._current_targets():
+            if self._libseq.getNoteDuration(step, note_val) <= 0:
+                continue
+            val = max(0, self._libseq.getStutterCount(step, note_val) + delta)
+            self._libseq.setStutterCount(step, note_val, val)
+
+    def _adjust_stutter_dur(self, delta):
+        for step, note_val in self._current_targets():
+            if self._libseq.getNoteDuration(step, note_val) <= 0:
+                continue
+            val = max(1, self._libseq.getStutterDur(step, note_val) + delta)
+            self._libseq.setStutterDur(step, note_val, val)
+
+    def _adjust_chance(self, delta):
+        for step, note_val in self._current_targets():
+            if self._libseq.getNoteDuration(step, note_val) <= 0:
+                continue
+            val = max(0, min(100, self._libseq.getNotePlayChance(step, note_val) + delta))
+            self._libseq.setNotePlayChance(step, note_val, val)
+
+    def _adjust_pitch(self, delta):
+        """Rigid transpose of the whole selection (or _last_note alone) by
+        `delta` keymap rows - all-or-nothing: if any target would clip past
+        either edge of the keymap, the whole turn is refused. Pitch is part
+        of a note's zynseq identity, so this is remove-all then add-all
+        (not an in-place setter), preserving each note's velocity/duration/
+        offset and re-pointing selection at the moved notes."""
+        if not delta:
+            return
+        targets = self._current_targets()
+        if not targets:
+            return
+
+        note_to_idx = {e["note"]: i for i, e in enumerate(self._keymap)}
+        plan = []
+        for step, note_val in targets:
+            idx = note_to_idx.get(note_val)
+            if idx is None:
+                return
+            new_idx = idx + delta
+            if not (0 <= new_idx < len(self._keymap)):
+                return
+            plan.append((step, note_val, self._keymap[new_idx]["note"]))
+
+        props = {
+            (step, note_val): (
+                self._libseq.getNoteVelocity(step, note_val),
+                self._libseq.getNoteDuration(step, note_val),
+                self._libseq.getNoteOffset(step, note_val),
+            )
+            for step, note_val, _ in plan
+        }
+        for step, note_val, _ in plan:
+            self._libseq.removeNote(step, note_val)
+
+        new_selected, new_last = set(), None
+        for step, old_note, new_note in plan:
+            vel, dur, off = props[(step, old_note)]
+            self._libseq.addNote(step, new_note, vel, dur, off)
+            new_selected.add((step, new_note))
+            new_last = (step, new_note)
+
+        if self._selected_notes:
+            self._selected_notes = new_selected
+        else:
+            self._last_note = new_last
+        self._paint_all()
+
+    # ----------------------------------------------------------------------
+    # Solo 1-4: Stop / Mute / Solo / Quantize (see plan doc)
+    # ----------------------------------------------------------------------
+    def _get_chain(self):
+        seq = self._get_selected_sequence()
+        if seq is None:
+            return None
+        chain_id = self._get_chain_id_by_sequence(self._zynseq.bank, seq)
+        return self._chain_manager.chains.get(chain_id)
+
+    def _stop_sequence(self):
+        seq = self._get_selected_sequence()
+        if seq is not None:
+            self._libseq.setPlayState(self._zynseq.bank, seq, zynseq.SEQ_STOPPED)
+
+    def _toggle_mute(self):
+        chain = self._get_chain()
+        if chain is None:
+            return
+        self._zynmixer.set_mute(chain.mixer_chan, self._zynmixer.get_mute(chain.mixer_chan) ^ 1, True)
+        self._update_leds()
+
+    def _toggle_solo(self):
+        chain = self._get_chain()
+        if chain is None:
+            return
+        self._zynmixer.set_solo(chain.mixer_chan, self._zynmixer.get_solo(chain.mixer_chan) ^ 1, True)
+        self._update_leds()
+
+    def _toggle_quantize(self):
+        self._libseq.setQuantizeNotes(not self._libseq.getQuantizeNotes())
+        self._update_leds()
+
+    # ----------------------------------------------------------------------
+    def note_on(self, note, velocity, shifted_override=None):
+        if note in ZYNPOT_KNOBS:
+            self._knobs_ease.reset(note)
+            return True
+        if note == BTN_SELECT_PRESS:
+            # No literal "Back" button on Fire (Device mode's is a borrowed
+            # grid pad, unavailable here - the whole grid is note cells) -
+            # Select's own push is otherwise unbound in this mode, so it
+            # clears the selection instead.
+            self._selected_notes.clear()
+            self._paint_all()
+            return True
+        if note == BTN_SOLO_1:
+            self._stop_sequence()
+            return True
+        if note == BTN_SOLO_2:
+            self._toggle_mute()
+            return True
+        if note == BTN_SOLO_3:
+            self._toggle_solo()
+            return True
+        if note == BTN_SOLO_4:
+            self._toggle_quantize()
+            return True
+        if note == BTN_GRID_LEFT:
+            self._page_steps(-1)
+            return True
+        if note == BTN_GRID_RIGHT:
+            self._page_steps(1)
+            return True
+        if note == BTN_PAT_UP:
+            self._scroll_rows(1)
+            return True
+        if note == BTN_PAT_DOWN:
+            self._scroll_rows(-1)
+            return True
+        if PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64:
+            return self._on_grid_press(note)
+        return False
+
+    def note_off(self, note, shifted_override=None):
+        if PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64:
+            self._on_grid_release(note)
+
+    def cc_change(self, ccnum, ccval):
+        if ccnum == KNOB_SELECT:
+            delta = ccval if ccval < 64 else ccval - 128
+            self._adjust_pitch(delta)
+            return True
+
+        if ccnum not in (KNOB_VOLUME, KNOB_PAN, KNOB_FILTER, KNOB_RESONANCE):
+            return
+
+        delta = self._knobs_ease.feed(ccnum, ccval)
+        if delta is None:
+            return True
+
+        if ccnum == KNOB_VOLUME:
+            self._adjust_velocity(delta)
+        elif ccnum == KNOB_PAN:
+            self._adjust_duration(delta)
+        elif ccnum == KNOB_FILTER:
+            self._adjust_chance(delta) if self._is_alt else self._adjust_stutter_count(delta)
+        elif ccnum == KNOB_RESONANCE:
+            self._adjust_stutter_dur(delta)
+        return True
+
+
+# --------------------------------------------------------------------------
+# Handle Play (live note-playing keyboard on the pad grid, forced active via
+# BTN_NOTE from any mode)
+# --------------------------------------------------------------------------
+#
+# v1, deliberately minimal (more from the DrivenByMoss manual excerpt this
+# was modeled on - scale/chromatic toggle, Piano mode, Accent, quantize - is
+# left for later): the whole grid is one contiguous 64-note chromatic
+# keyboard (no scale constraint), octave-shiftable via the Select knob.
+# Pressing a pad plays that note on the currently active chain for as long
+# as it's held, at the velocity the pad itself reports.
+#
+# Getting a live note to actually reach an engine turned out to need real
+# JACK-level MIDI I/O, not any Python/ctypes call - see the driver's own
+# midiproc_task() for the mechanism (a small always-on JACK client, spawned
+# in a subprocess by the base class's init_midiproc(), that passes Fire's
+# own raw input through unchanged and additionally emits whatever
+# PlayHandler queues via _send_note()/self._notes_queue). Two things tried
+# and rejected first, see git history for the full story:
+# lib_zyncore.write_zynmidi()/write_zynmidi_note_on() - turns out EVERY Note
+# On/Off reaching zynthian_state_manager.zynmidi_read() (from real hardware
+# or write_zynmidi() alike) only ever fires a zynsigman signal there
+# (SS_MIDI_NOTE_ON/OFF - checked every subscriber: zynpad's preview
+# highlight, the GUI's keyboard-CUIA emulation, APC's display sync - NOTHING
+# forwards it to an engine). That whole function is a control-plane path
+# (menus, mixer, MIDI learn, snapshot recall - CC/PC *do* reach chains from
+# there) - not an audio path, so no write_zynmidi variant could ever have
+# worked. zynseq.libseq.playNote() was tried too - it does reach engines via
+# a real JACK output (zynseq:output -> ZynMidiRouter:step_in), just not
+# reliably for an arbitrary chain (that output's own routing, not
+# necessarily wired to whatever chain happens to be active). The actual
+# working reference for real-time note generation from a ctrldev driver
+# turned out to be zynthian_ctrldev_akai_mpk_mini_mk3_moder.py (+
+# zynthian_ctrldev_base_moder.py) - a shipped driver that remaps incoming
+# keyboard notes to a scale entirely within its own midiproc_task, proving
+# the pattern this class's own midiproc_task() now follows too.
+#
+# The MIDI channel question is solved by ACTI mode
+# (lib_zyncore.zmip_set_flag_active_chain(), enabled on this driver's own
+# zmip in the top-level driver's init()) rather than by resolving which
+# chain owns which channel ourselves: with ACTI on, any note arriving on
+# this device's zmip routes to whichever chain is currently active,
+# regardless of the note's own channel - so PLAY_MIDI_CHAN can be any fixed
+# value, as long as it's not Fire's own raw channel (0) - see
+# unroute_from_chains on the top-level driver class, which keeps channel 0
+# out of chain routing while leaving every other channel (specifically
+# PLAY_MIDI_CHAN) open.
+#
+# Unlike Device/Mixer/Zynpad/StepSeq, this mode has no screen of its own to
+# be screen-linked to - see BTN_NOTE in midi_event, it force-activates and
+# unlinks, same as Alt+Perform does for Device mode.
+class PlayHandler(ModeHandlerBase):
+
+    BASE_NOTE_DEFAULT = 36   # matches DrivenByMoss PianoView's own default
+    TOTAL_NOTES = 64         # 4 rows x 16 cols
+    MAX_OCTAVE_STEPS = 5     # Select shifts by a full octave (12 semitones)
+                              # per tick, capped at +-5 steps from the default
+                              # - refuses (no-op) past that rather than
+                              # clamping to a partial, sub-octave shift, which
+                              # would misalign the grid pattern (root-note
+                              # markers etc. would land in different columns
+                              # than every other position) relative to it.
+
+    # DrivenByMoss's own Play mode color scheme (FireColorManager.java +
+    # Scales.getColor()): white for a regular playable note, blue for every
+    # occurrence of the octave/root note (note%12==0 - we have no tonic
+    # concept since scales are skipped, so this is always relative to C),
+    # green while held, red while held AND MIDI record is armed.
+    COLOR_OFF = (0, 0, 0)
+    COLOR_NOTE = (30, 30, 30)
+    COLOR_OCTAVE = (0, 0, 70)
+    COLOR_PLAYED = (0, 90, 0)
+    COLOR_RECORD = (90, 0, 0)
+
+    def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs, notes_queue: mp.Queue):
+        super().__init__(state_manager)
+        self._leds = leds
+        self._pads = pads
+        self._notes_queue = notes_queue  # drained by the driver's midiproc_task
+        self._zynpot = ZynpotRotate(state_manager)
+        self._base_note = self.BASE_NOTE_DEFAULT
+        self._octave_step = 0   # -MAX_OCTAVE_STEPS..+MAX_OCTAVE_STEPS, see _shift_octave
+        self._play_chan = _resolve_play_midi_chan()  # refreshed in set_active(True) too
+        # Pad note -> (midi note, channel) actually sounding for it - both
+        # fixed at press time and reused as-is on release/panic, rather than
+        # recomputed, so a note always gets its note-off on the exact
+        # channel it was started on even if the active chain changes (or the
+        # octave shifts) while it's held - otherwise the note-off could go
+        # to the wrong channel and leave the original note stuck forever.
+        # (In practice channel is always None or self._play_chan - kept as a
+        # per-note field anyway rather than assumed constant, in case a
+        # future change makes it vary again.)
+        self._held = {}
+
+    def set_active(self, active):
+        super().set_active(active)
+        if active:
+            self._play_chan = _resolve_play_midi_chan()
+        else:
+            # Notes are sustained (duration=0) until explicitly stopped -
+            # leaving this mode with pads still held would otherwise leave
+            # them stuck on forever.
+            self._all_notes_off()
+
+    def _midi_note(self, row, col):
+        return self._base_note + (3 - row) * 16 + col
+
+    def _active_channel(self):
+        """self._play_chan if there's a chain that can actually take notes
+        right now, else None - which chain doesn't matter here: ACTI mode
+        (see class comment) routes any note on this channel to whichever
+        chain is active, so this is just a sanity check, not a resolution."""
+        chain = self._chain_manager.get_active_chain()
+        if chain is None or not chain.is_midi():
+            return None
+        return self._play_chan
+
+    def refresh(self):
+        self._held = {}
+        for row in range(4):
+            for col in range(16):
+                self._paint_pad(row, col)
+        self._update_leds()
+
+    def _paint_pad(self, row, col, pressed=False):
+        note_pad = _pad(row, col)
+        note_val = self._midi_note(row, col)
+        if not (0 <= note_val <= 127):
+            self._pads.pad_off(note_pad)
+            return
+        if pressed:
+            color = self.COLOR_RECORD if self._zynseq.libseq.isMidiRecord() else self.COLOR_PLAYED
+        elif note_val % 12 == 0:
+            color = self.COLOR_OCTAVE
+        else:
+            color = self.COLOR_NOTE
+        self._pads.set_pad(note_pad, *color)
+
+    def _update_leds(self):
+        chain = self._chain_manager.get_active_chain()
+        self._leds.led_on(LED_SOLO_2, LED_GREEN_HIGH) if chain is not None and self._zynmixer.get_mute(chain.mixer_chan) \
+            else self._leds.led_off(LED_SOLO_2)
+        self._leds.led_on(LED_SOLO_3, LED_GREEN_HIGH) if chain is not None and self._zynmixer.get_solo(chain.mixer_chan) \
+            else self._leds.led_off(LED_SOLO_3)
+        self._leds.led_off(LED_SOLO_1)
+        self._leds.led_off(LED_SOLO_4)  # unbound for now
+
+    def _send_note(self, note_val, velocity, channel):
+        """Queue a Note On (velocity 0 = off, standard MIDI convention - no
+        separate note-off call needed) for the driver's midiproc_task to
+        actually emit on the real-time JACK port it owns - see the class
+        comment for why this, and not any direct Python/ctypes call, is
+        what it takes to reach an engine. channel is only accepted for
+        symmetry with how _held tracks its per-note channel field - always
+        self._play_chan in practice (see _active_channel())."""
+        self._notes_queue.put((0x90 | channel, note_val, velocity))
+
+    def _all_notes_off(self):
+        for note_pad, (note_val, channel) in self._held.items():
+            if channel is not None:
+                self._send_note(note_val, 0, channel)
+            idx = note_pad - PAD_NOTE_BASE
+            self._paint_pad(idx // 16, idx % 16)
+        self._held = {}
+
+    def _shift_octave(self, delta):
+        new_step = self._octave_step + (1 if delta > 0 else -1)
+        if not (-self.MAX_OCTAVE_STEPS <= new_step <= self.MAX_OCTAVE_STEPS):
+            return
+        new_base = self.BASE_NOTE_DEFAULT + new_step * 12
+        if not (0 <= new_base <= 127 - (self.TOTAL_NOTES - 1)):
+            return  # extra safety net, shouldn't trigger given MAX_OCTAVE_STEPS
+        self._all_notes_off()  # avoid leaving notes stuck on under the old mapping
+        self._octave_step = new_step
+        self._base_note = new_base
+        self.refresh()
+
+    def _toggle_mute(self):
+        chain = self._chain_manager.get_active_chain()
+        if chain is None:
+            return
+        self._zynmixer.set_mute(chain.mixer_chan, self._zynmixer.get_mute(chain.mixer_chan) ^ 1, True)
+        self._update_leds()
+
+    def _toggle_solo(self):
+        chain = self._chain_manager.get_active_chain()
+        if chain is None:
+            return
+        self._zynmixer.set_solo(chain.mixer_chan, self._zynmixer.get_solo(chain.mixer_chan) ^ 1, True)
+        self._update_leds()
+
+    def _switch_chain(self, nudge):
+        # Same chain-scroll MixerHandler's own Select knob already uses -
+        # switches which chain you're playing into without touching the
+        # actual screen/mode. Already-held notes remember their own
+        # channel (see class comment), so switching chain mid-chord doesn't
+        # affect notes already sounding, only new presses from here on.
+        self._chain_manager.next_chain(nudge)
+        self._update_leds()
+
+    def note_on(self, note, velocity, shifted_override=None):
+        if note in ZYNPOT_KNOBS:
+            self._zynpot.reset(note)
+            return True
+        if note == BTN_SELECT_PRESS:
+            self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
+            return True
+        if note == BTN_SOLO_1:
+            # No specific "stop" target here (unlike StepSeq's Solo1) - a
+            # panic button for this handler's own sustained notes instead.
+            self._all_notes_off()
+            return True
+        if note == BTN_SOLO_2:
+            self._toggle_mute()
+            return True
+        if note == BTN_SOLO_3:
+            self._toggle_solo()
+            return True
+        if note == BTN_GRID_LEFT:
+            self._switch_chain(-1)
+            return True
+        if note == BTN_GRID_RIGHT:
+            self._switch_chain(1)
+            return True
+
+        if PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64:
+            if note in self._held:
+                # Already sounding - e.g. a repeated Note On for a pad
+                # that's still physically held (seen on real hardware).
+                # Ignore rather than re-triggering the note.
+                return True
+            idx = note - PAD_NOTE_BASE
+            row, col = idx // 16, idx % 16
+            note_val = self._midi_note(row, col)
+            if not (0 <= note_val <= 127):
+                return True
+            channel = self._active_channel()
+            self._held[note] = (note_val, channel)
+            if channel is not None:
+                self._send_note(note_val, velocity, channel)
+            self._paint_pad(row, col, pressed=True)
+            return True
+        return False
+
+    def note_off(self, note, shifted_override=None):
+        if not (PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64):
+            return
+        info = self._held.pop(note, None)
+        if info is None:
+            return
+        note_val, channel = info
+        if channel is not None:
+            self._send_note(note_val, 0, channel)
+        idx = note - PAD_NOTE_BASE
+        self._paint_pad(idx // 16, idx % 16)
+
+    def cc_change(self, ccnum, ccval):
+        if ccnum == KNOB_SELECT:
+            delta = ccval if ccval < 64 else ccval - 128
+            self._shift_octave(delta)
             return True
         return self._zynpot.cc_change(ccnum, ccval)
 
@@ -1091,14 +1937,31 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
     # reports differs from what `aconnect -l` shows (see other drivers' dev_ids for why).
     dev_ids = ["FL STUDIO FIRE", "FL STUDIO FIRE MIDI 1", "FL STUDIO FIRE IN 1"]
     driver_name = 'AKAI Fire'
-    driver_description = 'Device + Mixer + Zynpad modes (OLED not yet implemented)'
+    driver_description = 'Device + Mixer + Zynpad + StepSeq + Play modes (OLED not yet implemented)'
+
+    # Block only Fire's own raw channel (buttons/pads, always channel 0) from
+    # reaching chains as notes - every other channel, specifically
+    # PLAY_MIDI_CHAN (used by midiproc_task's own injected notes, see
+    # PlayHandler's class comment), passes through normally. A bitmask, not
+    # a bool - see zynthian_ctrldev_base.unroute_from_chains's own docstring.
+    # (Confirmed via the diagnostic tried while chasing the real bug - an
+    # orphaned duplicate midiproc process from a since-fixed early-boot
+    # crash, see _alt_mode()'s comment - that this bitmask was never the
+    # problem in the first place.)
+    unroute_from_chains = 0b0000000000000001
 
     def __init__(self, state_manager, idev_in, idev_out=None):
         self._leds = FeedbackLEDs(idev_out)
         self._pads = PadLEDs(idev_out)
+        # IPC to midiproc_task (runs in a spawned subprocess, see init_midiproc()
+        # in the base class) - PlayHandler puts (status, note, vel) tuples here,
+        # midiproc_task drains and emits them on its own real-time JACK port.
+        self._play_notes_queue = mp.Queue()
         self._device_handler = DeviceHandler(state_manager, self._leds, self._pads)
         self._mixer_handler = MixerHandler(state_manager, self._leds, self._pads)
         self._zynpad_handler = ZynpadHandler(state_manager, self._pads)
+        self._stepseq_handler = StepSeqHandler(state_manager, self._leds, self._pads)
+        self._play_handler = PlayHandler(state_manager, self._leds, self._pads, self._play_notes_queue)
         self._current_handler = self._device_handler
 
         self._is_shifted = False
@@ -1136,15 +1999,120 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         # super().init()/end() cooperatively chain through BOTH mixins here
         # (zynmixer -> zynpad -> base), verified via MRO - no need for the
         # explicit extra zynthian_ctrldev_zynpad.init(self)/end(self) call
-        # some other multi-mixin drivers in this codebase carry.
+        # some other multi-mixin drivers in this codebase carry. This is
+        # also what spawns midiproc_task (zynthian_ctrldev_base.init() ->
+        # init_midiproc()).
         super().init()
         for signal, subsignal, callback in self._signals:
             zynsigman.register(signal, subsignal, callback)
 
+        # ACTI mode ("active chain input"): any note arriving on this
+        # device's zmip routes to whichever chain is currently active,
+        # regardless of the note's own channel - see PlayHandler's class
+        # comment for why this is how PLAY_MIDI_CHAN gets resolved to an
+        # actual target, rather than us matching a channel to a chain
+        # ourselves.
+        lib_zyncore.zmip_set_flag_active_chain(self.idev, 1)
+
+        # zmop_set_route_from(zmop, zmip, enable) is a SEPARATE per-(chain,
+        # device) permission matrix - unroute_from_chains/ACTI above only
+        # decide what happens to traffic that's already allowed to reach a
+        # chain at all; this is the gate that allows it there in the first
+        # place. New chains enable every device here by default
+        # (zynthian_chain_manager.add_chain()), but zynthian_state_manager
+        # also restores a *persisted per-device* "routed_chains" list at
+        # config load that overwrites that - and since this device has
+        # presumably been known to zynthian as a pure controller (no note
+        # output) this whole time, that saved list is quite plausibly empty
+        # for it. Force it open ourselves rather than depend on that state.
+        for zmop in range(16):
+            lib_zyncore.zmop_set_route_from(zmop, self.idev, 1)
+
     def end(self):
+        # Safety net: guarantee any still-sounding Play-mode notes get their
+        # note-off, and StepSeq's playhead poll timer stops, regardless of
+        # which handler is actually current when the driver is torn down
+        # (see PlayHandler.set_active / StepSeqHandler.set_active).
+        self._play_handler.set_active(False)
+        self._stepseq_handler.set_active(False)
+        lib_zyncore.zmip_set_flag_active_chain(self.idev, 0)
+        for zmop in range(16):
+            lib_zyncore.zmop_set_route_from(zmop, self.idev, 0)
         for signal, subsignal, callback in self._signals:
             zynsigman.unregister(signal, subsignal, callback)
         super().end()
+
+    # ------------------------------------------------------------------
+    # Real-time MIDI processor (spawned in its own process by the base
+    # class's init_midiproc(), see zynthian_ctrldev_base.py) - passes
+    # Fire's own raw input through unchanged (so this driver's normal
+    # button/pad/knob handling, via dev{N}_in -> zynmidi_read(), sees
+    # everything exactly as it would without a midiproc at all) and
+    # additionally emits whatever PlayHandler queues onto self._play_notes_queue.
+    # See PlayHandler's class comment for why this exists - modeled directly
+    # on zynthian_ctrldev_base_moder.py's own midiproc_task (a shipped,
+    # working reference for real-time note generation from a ctrldev driver).
+    # ------------------------------------------------------------------
+    def midiproc_task(self, jackname):
+        zynthian_ctrldev_base.midiproc_task_reset_signal_handlers()
+
+        import jack
+        from threading import Event
+
+        client = jack.Client(jackname)
+        inport = client.midi_inports.register('in_1')
+        outport = client.midi_outports.register('out_1')
+        event = Event()
+
+        @client.set_process_callback
+        def process(frames):
+            outport.clear_buffer()
+            last_offset = 0
+            # Fire's own hardware only ever sends on channel 0 - anything
+            # arriving here on the reserved Play-mode channel can only be
+            # some kind of loopback of our own injected notes, not real
+            # device input (the actual loopback path turned out to be
+            # zynthian_state_manager.zynmidi_read()'s software tap on this
+            # zmip, guarded against directly in the top-level driver's
+            # midi_event() - this is just cheap extra defense in case
+            # anything else ever reaches this port on that channel).
+            play_chan = _resolve_play_midi_chan()
+            for offset, indata in inport.incoming_midi_events():
+                # indata isn't plain bytes (some jack-client buffer/cffi
+                # type where [0] doesn't give a plain int) - normalize
+                # first, same as the reference examples do via
+                # struct.unpack.
+                raw = bytes(indata)
+                if raw and (raw[0] & 0x0F) == play_chan and (raw[0] & 0xF0) in (0x80, 0x90):
+                    continue
+                outport.write_midi_event(offset, indata)  # pass through, unchanged
+                last_offset = offset
+
+            # Drain any pending Play-mode notes - non-blocking, this runs on
+            # every JACK cycle so nothing is ever left waiting long even if
+            # drained one cycle late. Written at last_offset (not a fixed 0):
+            # JACK MIDI output requires events within one process() call to
+            # be written in non-decreasing offset order, and the pass-through
+            # loop above may already have used offsets > 0 this cycle -
+            # writing at a fixed 0 after that violates the ordering and
+            # raises. Sample-accurate timing doesn't matter for hand-played
+            # notes anyway.
+            while True:
+                try:
+                    event_bytes = self._play_notes_queue.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    outport.write_midi_event(last_offset, event_bytes)
+                except Exception:
+                    pass
+
+        @client.set_shutdown_callback
+        def shutdown(status, reason):
+            event.set()
+
+        with client:
+            event.wait()
 
     def refresh(self):
         self._current_handler.refresh()
@@ -1158,7 +2126,9 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             else self._leds.led_off(LED_BROWSER)
 
         # Perform (yellow-red): red in Mixer mode, yellow in Zynpad mode, off
-        # in Device mode.
+        # in Device/StepSeq/Play mode (Perform only toggles between the two
+        # "performance" screens - see BTN_PERFORM - neither is part of that
+        # toggle).
         if self._current_handler is self._mixer_handler:
             self._leds.led_on(LED_PERFORM, LED_YR_HIGH_RED)
         elif self._current_handler is self._zynpad_handler:
@@ -1173,6 +2143,25 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
     def midi_event(self, ev):
         evtype = (ev[0] >> 4) & 0x0F
 
+        # Loopback guard: our own Play-mode notes (see PlayHandler /
+        # midiproc_task) reach this exact callback a second time, not just
+        # chains - zynthian_state_manager.zynmidi_read() taps ALL zmip
+        # traffic in software (not only JACK-level real-time routing) and
+        # hands it to ctrldev_manager.midi_event() for OUR OWN device
+        # before anything else happens to it. Every note/button check below
+        # matches on note number alone, never channel, because Fire's real
+        # hardware only ever sends channel 0 - so without this, our own
+        # injected notes get misread as pad presses (cascading phantom
+        # presses, since Play mode's note range overlaps the pad range) or
+        # as specific buttons whose note number they happen to coincide
+        # with (e.g. BTN_SOLO_2/3 = 37/38, right at Play mode's own
+        # BASE_NOTE_DEFAULT=36, spuriously toggling mute/solo - confirmed
+        # on real hardware). Real Fire input is always channel 0, so
+        # anything here on the reserved Play channel can only be our own
+        # echo - consume and drop it before it reaches anything else.
+        if evtype in (EV_NOTE_ON, EV_NOTE_OFF) and (ev[0] & 0x0F) == _resolve_play_midi_chan():
+            return True
+
         if evtype == EV_NOTE_ON:
             note = ev[1] & 0x7F
             vel = ev[2] & 0x7F
@@ -1186,10 +2175,37 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 # Alt+Browser (screen-link toggle) and Alt+Perform (jump to
                 # Device) work from any mode, so _is_alt itself is tracked
                 # unconditionally above - but only forward into MixerHandler
-                # (its Alt+Solo-N = toggle solo modifier) while it's
-                # actually the active mode.
+                # (its Alt+Solo-N = toggle solo modifier) or StepSeqHandler
+                # (its Alt+Filter = play chance modifier) while one of them
+                # is actually the active mode.
                 if self._current_handler is self._mixer_handler:
                     self._mixer_handler.set_alt(True)
+                elif self._current_handler is self._stepseq_handler:
+                    self._stepseq_handler.set_alt(True)
+                return True
+            if note == BTN_STEP:
+                if self._current_handler is self._play_handler:
+                    # Play mode's unlink (see BTN_NOTE below) is scoped to
+                    # staying in Play mode - leaving it via BTN_STEP should
+                    # restore screen-linking like every other way out does,
+                    # not leave it stuck unlinked. The CUIA below then drives
+                    # screen-follow into StepSeq normally.
+                    self._screen_linked = True
+                # Screen-driven, like Perform: send the CUIA and let
+                # screen-follow (_update_current_handler) pick up StepSeq if
+                # linked. SCREEN_PATTERN_EDITOR itself resolves "which
+                # pattern" from zynpad's currently selected sequence (same as
+                # pressing Zynseq from Device mode, or the touchscreen).
+                self.state_manager.send_cuia("SCREEN_PATTERN_EDITOR")
+                return True
+            if note == BTN_NOTE:
+                # Unlike the other modes, Play has no screen of its own to be
+                # screen-linked to - force it on directly and unlink, same as
+                # Alt+Perform does for Device mode, so it sticks regardless
+                # of the touchscreen.
+                self._screen_linked = False
+                self._set_current_handler(self._play_handler)
+                self._update_mode_leds()
                 return True
             if note == BTN_PERFORM:
                 if self._is_alt:
@@ -1201,15 +2217,27 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                     self._screen_linked = False
                     self._set_current_handler(self._device_handler)
                     self._update_mode_leds()
+                elif self._current_handler is self._play_handler:
+                    # Same reasoning as BTN_STEP above: Play mode's unlink is
+                    # scoped to staying in Play mode, and Perform is the
+                    # normal "go back" button - restore screen-linking and
+                    # resync immediately to whatever's actually on the
+                    # touchscreen (unchanged the whole time, since Play mode
+                    # never touches the screen itself), landing back on
+                    # StepSeq/Zynpad/Mixer/Device as appropriate.
+                    self._screen_linked = True
+                    self._update_current_handler()
                 elif self._screen_linked:
                     # Screen-driven: change the actual screen; screen-follow
                     # (_update_current_handler) then updates the mode to
                     # match. Toggles between the two "performance" screens:
-                    # from mixer, go to zynpad; from anywhere else
-                    # (including Device mode's screens), go to mixer - so
-                    # repeated presses settle into alternating mixer <->
-                    # zynpad.
-                    if self._last_screen == "audio_mixer":
+                    # from mixer or StepSeq (pattern_editor - you got there
+                    # from zynpad in the first place, via BTN_STEP or
+                    # Shift+Pad, so this reads as "go back"), go to zynpad;
+                    # from anywhere else (including Device mode's screens),
+                    # go to mixer - so repeated presses settle into
+                    # alternating mixer <-> zynpad.
+                    if self._last_screen in ("audio_mixer", "pattern_editor"):
                         self.state_manager.send_cuia("SCREEN_ZYNPAD")
                     else:
                         self.state_manager.send_cuia("SCREEN_AUDIO_MIXER")
@@ -1265,6 +2293,8 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 self._is_alt = False
                 if self._current_handler is self._mixer_handler:
                     self._mixer_handler.set_alt(False)
+                elif self._current_handler is self._stepseq_handler:
+                    self._stepseq_handler.set_alt(False)
                 return True
             if note in (BTN_PLAY, BTN_STOP):
                 self._btn_timer.is_released(note)
@@ -1317,12 +2347,21 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         refreshing its pad state and the mode LEDs."""
         if self._current_handler is handler:
             return
+        old_handler = self._current_handler
         self._current_handler = handler
         if handler is self._mixer_handler:
             # Pick up Alt if it was already held before switching in (its
-            # press/release edges only forward to MixerHandler while it's
-            # already the active mode - see BTN_ALT handling).
+            # press/release edges only forward to MixerHandler/StepSeqHandler
+            # while one of them is already the active mode - see BTN_ALT
+            # handling).
             self._mixer_handler.set_alt(self._is_alt)
+        elif handler is self._stepseq_handler:
+            self._stepseq_handler.set_alt(self._is_alt)
+        # set_active() is a no-op for every handler except PlayHandler, which
+        # uses it to stop any still-sounding notes on the way out - harmless
+        # to call unconditionally on both ends of the switch.
+        old_handler.set_active(False)
+        handler.set_active(True)
         # Unconditional full clear rather than each handler tracking which
         # notes the *other* one used - simpler, and can't miss anything as
         # more pad-owning modes are added.
@@ -1342,6 +2381,8 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             self._set_current_handler(self._mixer_handler)
         elif self._last_screen == "zynpad":
             self._set_current_handler(self._zynpad_handler)
+        elif self._last_screen == "pattern_editor":
+            self._set_current_handler(self._stepseq_handler)
         else:
             self._set_current_handler(self._device_handler)
 
