@@ -1372,14 +1372,31 @@ class StepSeqHandler(ModeHandlerBase):
     PLAYHEAD_GREEN_BOOST = 40
     PLAYHEAD_POLL_MS = 200   # matches zynthian_gui's own status-refresh rate
 
-    def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs):
+    # Tonic guidance line: every row whose note is the pattern's root note
+    # (note%12 == getTonic(), see _load_keymap/_paint_pad) gets a dim white
+    # tint spanning the whole row, empty cells included - a constant visual
+    # reference for "where the root note is" while scrolling, in Chromatic
+    # too (not just an active scale - the tonic field means something
+    # either way, see _adjust_tonic). Additive on top of whatever else the
+    # cell would show (note/tail/selected/playhead), not a replacement, so
+    # it reads as a guide line rather than hiding other state; a small dim
+    # white boost stays visibly distinct from the playhead's green and the
+    # selection's yellow regardless of which of those the row also has.
+    COLOR_TONIC_EMPTY = (18, 18, 18)
+    TONIC_ROW_BOOST = 18
+
+    def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs, oled_refresh_cb=None):
         super().__init__(state_manager)
         self._leds = leds
         self._pads = pads
+        self._oled_refresh_cb = oled_refresh_cb  # top-level driver's _refresh_oled, see _on_scale_changed
         self._libseq = self._zynseq.libseq
         self._knobs_ease = KnobJitterFilter()
         self._is_alt = False
 
+        self._scale_label = "Chromatic"  # OLED status line, see _load_keymap()/oled_status()
+        self._tonic = 0          # root note (0-11), see _load_keymap()/_paint_pad's tonic-row tint
+        self._degree_count = 12  # rows/octave, see _load_keymap()/note_on's Alt+Pattern Up/Down
         self._keymap = [{"note": n} for n in range(128)]
         self._row_offset = 0    # index into _keymap of the topmost visible row
         self._step_page = 0     # which 16-step page of the pattern is visible
@@ -1410,21 +1427,50 @@ class StepSeqHandler(ModeHandlerBase):
         self._playhead_timer = IntervalTimer()
 
     def set_alt(self, state):
-        # Momentary BTN_ALT, used as the Filter-knob modifier (Alt+Filter =
-        # play chance instead of stutter count) - see cc_change().
+        # Momentary BTN_ALT, used as a modifier for the Filter knob
+        # (Alt+Filter = play chance instead of stutter count), Grid
+        # Left/Right (Alt+Grid = cycle scale instead of step-paging - see
+        # note_on/_cycle_scale) and Pattern Up/Down (Alt+Pattern = scroll a
+        # full octave's worth of rows instead of 1 - see note_on/
+        # _scroll_rows; Shift+Pattern scrolls a full 4-row page instead).
         self._is_alt = state
 
     # ----------------------------------------------------------------------
     # Keymap / view
     # ----------------------------------------------------------------------
-    def _load_keymap(self):
+    def _load_keymap(self, recenter=True):
         """Rebuild self._keymap from the current pattern's scale/tonic,
         mirroring zynthian_gui_patterneditor.py's load_keymap() (chromatic,
         or a scales.json scale) - custom .midnam keymaps and CC display mode
-        are out of scope here. Also re-centers the row view on middle C."""
+        are out of scope here.
+
+        This is the pattern's own Scale/Tonic (getScale()/getTonic() - the
+        same fields the touchscreen pattern editor's own Scale/Tonic menu
+        items set, see _cycle_scale/_adjust_tonic below), not a StepSeq-only
+        setting - unlike PlayHandler's scale, which is deliberately
+        independent (see its own class comment), a pattern's scale is
+        already real, shared, persisted pattern state, so there's no reason
+        for the Fire to keep a second copy of it.
+
+        recenter=True (refresh() - a new pattern/mode activation) re-centers
+        the row view on middle C, same as before. recenter=False
+        (_on_scale_changed() - still the same pattern, just its scale/tonic
+        changed) instead keeps showing roughly the same pitch range: the
+        note that was at the current row_offset gets relocated in the new
+        keymap (its nearest match, since the exact note may no longer be
+        in-scale) and the view re-anchors there - changing scale would
+        otherwise always yank the view back to middle C, losing whatever
+        octave you'd scrolled to."""
+        anchor_note = None
+        if not recenter and self._keymap and 0 <= self._row_offset < len(self._keymap):
+            anchor_note = self._keymap[self._row_offset]["note"]
+
         scale = self._libseq.getScale()
         tonic = self._libseq.getTonic()
+        self._tonic = tonic
+        self._degree_count = 12  # rows/octave for Alt+Pattern Up/Down - see note_on
         keymap = []
+        self._scale_label = "Chromatic"
         if scale > 1:
             try:
                 with open(ZYNSEQ_CONFIG_ROOT + "/scales.json") as f:
@@ -1437,14 +1483,54 @@ class StepSeqHandler(ModeHandlerBase):
                             if note > 127:
                                 break
                             keymap.append({"note": note})
+                    self._scale_label = f"{NOTE_NAMES[tonic]} {entry['name']}"
+                    self._degree_count = len(entry["scale"])
             except Exception as ex:
                 logging.warning(f"StepSeqHandler: can't load scales.json => {ex}")
         if not keymap:
             keymap = [{"note": n} for n in range(128)]
         self._keymap = keymap
 
-        idx = next((i for i, e in enumerate(keymap) if e["note"] >= 60), 0)
+        if recenter or anchor_note is None:
+            idx = next((i for i, e in enumerate(keymap) if e["note"] >= 60), 0)
+        else:
+            idx = min(range(len(keymap)), key=lambda i: abs(keymap[i]["note"] - anchor_note))
         self._row_offset = max(0, min(idx - 1, len(keymap) - 4))
+
+    def _cycle_scale(self, delta):
+        """Alt+Grid Left/Right - cycles the pattern's Scale param through 0
+        (Chromatic) .. len(scales.json) inclusive, wrapping either way -
+        same convention (and the same file) PlayHandler's own _cycle_scale
+        uses, just applied to zynseq's real per-pattern field instead of a
+        StepSeq-local one."""
+        try:
+            with open(ZYNSEQ_CONFIG_ROOT + "/scales.json") as f:
+                count = len(json.load(f))
+        except Exception as ex:
+            logging.warning(f"StepSeqHandler: can't load scales.json => {ex}")
+            count = 0
+        scale = (self._libseq.getScale() + (1 if delta > 0 else -1)) % (count + 1)
+        self._libseq.setScale(scale)
+        self._on_scale_changed()
+
+    def _adjust_tonic(self, delta):
+        """Shift+Grid Left/Right - adjusts the pattern's Tonic (root note),
+        wrapping 0-11 (C-B)."""
+        tonic = (self._libseq.getTonic() + (1 if delta > 0 else -1)) % 12
+        self._libseq.setTonic(tonic)
+        self._on_scale_changed()
+
+    def _on_scale_changed(self):
+        self._load_keymap(recenter=False)
+        self._paint_all()
+        if self._oled_refresh_cb:
+            self._oled_refresh_cb()
+
+    def oled_status(self):
+        """Secondary OLED line while StepSeq is active (see the top-level
+        driver's _refresh_oled) - the current pattern's scale/tonic, e.g.
+        'C Major', or 'Chromatic'."""
+        return self._scale_label
 
     def _keymap_index(self, phys_row):
         """Physical pad row (0=top) -> index into self._keymap, or None if
@@ -1470,9 +1556,14 @@ class StepSeqHandler(ModeHandlerBase):
         self._step_page = max(0, min(self._step_page + direction, max_page))
         self._paint_all()
 
-    def _scroll_rows(self, direction):
+    def _scroll_rows(self, direction, amount=1):
+        """Plain Pattern Up/Down scroll by 1 row; Shift+Pattern Up/Down (see
+        note_on) passes amount=4 (a full page - the visible window height);
+        Alt+Pattern Up/Down passes amount=self._degree_count (one octave's
+        worth of rows - 12 for Chromatic, or however many degrees the
+        active scale has, see _load_keymap)."""
         max_offset = max(0, len(self._keymap) - 4)
-        self._row_offset = max(0, min(self._row_offset + direction, max_offset))
+        self._row_offset = max(0, min(self._row_offset + direction * amount, max_offset))
         self._paint_all()
 
     # ----------------------------------------------------------------------
@@ -1533,10 +1624,16 @@ class StepSeqHandler(ModeHandlerBase):
             self._pads.pad_off(note_pad)
             return
         note_val = self._keymap[idx]["note"]
+        is_tonic_row = note_val % 12 == self._tonic
         start = self._libseq.getNoteStart(step, note_val)
         on_playhead = step == self._playhead_step
         if start < 0:
-            color = self.COLOR_PLAYHEAD_EMPTY if on_playhead else self.COLOR_EMPTY
+            if on_playhead:
+                color = self.COLOR_PLAYHEAD_EMPTY
+            elif is_tonic_row:
+                color = self.COLOR_TONIC_EMPTY
+            else:
+                color = self.COLOR_EMPTY
             self._pads.set_pad(note_pad, *color)
             return
         selected = (start, note_val) in self._selected_notes
@@ -1547,6 +1644,10 @@ class StepSeqHandler(ModeHandlerBase):
         if on_playhead:
             r, g, b = color
             color = (r, min(127, g + self.PLAYHEAD_GREEN_BOOST), b)
+        if is_tonic_row:
+            r, g, b = color
+            boost = self.TONIC_ROW_BOOST
+            color = (min(127, r + boost), min(127, g + boost), min(127, b + boost))
         self._pads.set_pad(note_pad, *color)
 
     def _paint_pad_at(self, step, note_val):
@@ -1788,16 +1889,36 @@ class StepSeqHandler(ModeHandlerBase):
             self._toggle_quantize()
             return True
         if note == BTN_GRID_LEFT:
-            self._page_steps(-1)
+            if self._is_alt:
+                self._cycle_scale(-1)
+            elif shifted_override:
+                self._adjust_tonic(-1)
+            else:
+                self._page_steps(-1)
             return True
         if note == BTN_GRID_RIGHT:
-            self._page_steps(1)
+            if self._is_alt:
+                self._cycle_scale(1)
+            elif shifted_override:
+                self._adjust_tonic(1)
+            else:
+                self._page_steps(1)
             return True
         if note == BTN_PAT_UP:
-            self._scroll_rows(1)
+            if self._is_alt:
+                self._scroll_rows(1, self._degree_count)
+            elif shifted_override:
+                self._scroll_rows(1, 4)
+            else:
+                self._scroll_rows(1)
             return True
         if note == BTN_PAT_DOWN:
-            self._scroll_rows(-1)
+            if self._is_alt:
+                self._scroll_rows(-1, self._degree_count)
+            elif shifted_override:
+                self._scroll_rows(-1, 4)
+            else:
+                self._scroll_rows(-1)
             return True
         if PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64:
             return self._on_grid_press(note)
@@ -2387,7 +2508,7 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         self._device_handler = DeviceHandler(state_manager, self._leds, self._pads)
         self._mixer_handler = MixerHandler(state_manager, self._leds, self._pads)
         self._zynpad_handler = ZynpadHandler(state_manager, self._pads)
-        self._stepseq_handler = StepSeqHandler(state_manager, self._leds, self._pads)
+        self._stepseq_handler = StepSeqHandler(state_manager, self._leds, self._pads, self._refresh_oled)
         self._play_handler = PlayHandler(state_manager, self._leds, self._pads, self._play_notes_queue,
                                           self._refresh_oled)
         self._current_handler = self._device_handler
