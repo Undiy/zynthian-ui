@@ -37,16 +37,22 @@
 # zynthian_ctrldev_akai_fire_stepseq_plan.md for the design this implements).
 # The fifth, "Play" (reached via BTN_NOTE - a chromatic note-playing keyboard
 # on the pad grid), has no screen of its own and is forced on/off directly
-# instead. The OLED is intentionally untouched for now. Drum is unbound,
-# reserved for a future mode.
+# instead. The OLED (see OledDisplay) shows the current mode name, refreshed
+# on every mode switch - a first, deliberately trivial use of it, mainly to
+# confirm the SysEx bit-packing actually paints correctly on real hardware
+# before building anything content-richer (e.g. a scale indicator) on top of
+# it. Drum is unbound, reserved for a future mode.
 #
 # ******************************************************************************
 
+import os
 import time
 import json
 import queue
 import logging
 import multiprocessing as mp
+
+from PIL import Image, ImageDraw, ImageFont
 
 from zynlibs.zynseq import zynseq
 from zyngine.ctrldev.zynthian_ctrldev_base import zynthian_ctrldev_base, zynthian_ctrldev_zynmixer, zynthian_ctrldev_zynpad
@@ -190,6 +196,13 @@ def _pad(row, col):
     return PAD_NOTE_BASE + row * 16 + col
 
 
+# Same table as zynthian_gui_patterneditor.py's own NOTE_NAMES - kept as a
+# local copy rather than imported (zyngine/ctrldev doesn't otherwise depend
+# on zyngui screen modules) - used by PlayHandler for its OLED scale/tonic
+# status line.
+NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+
+
 # Device-mode button matrix, hosted on the otherwise-idle pad grid - mirrors
 # zynthian_ctrldev_akai_apc_key25_mk2.py's DeviceHandler pad layout, adapted to
 # Fire's 4 rows (APC's equivalent uses 5):
@@ -305,6 +318,161 @@ class PadLEDs:
 
     def pad_off(self, note):
         self.set_pad(note, 0, 0, 0)
+
+
+# --------------------------------------------------------------------------
+# OLED display (SysEx, 128x64 monochrome, sent as 8 horizontal 8px-tall
+# stripes) - see zynthian_ctrldev_akai_fire_protocol.md for the wire format
+# and the BIT_MUTATE remap table (transcribed there from DrivenByMoss's
+# FireDisplay.java). This is the first use of the OLED in this driver - the
+# SysEx encoding itself is what's unverified against real hardware, so
+# _refresh_oled() (top-level driver) deliberately keeps the content trivial
+# (mode name only) for the first hardware test; richer content (a scale
+# indicator, once scales exist, etc.) is future work once this is confirmed
+# to actually paint correctly.
+# --------------------------------------------------------------------------
+class OledDisplay:
+    WIDTH = 128
+    HEIGHT = 64
+    STRIPES = 8
+    STRIPE_HEIGHT = 8
+    STRIPE_SIZE = 147   # ceil(128*8/7) - 1 bit/pixel packed 7 bits/byte
+    SYSEX_HEADER = (0xF0, 0x47, 0x7F, 0x43, 0x0E)
+
+    # zynthian's own default UI typeface (zynthian_gui_config.font_family),
+    # shipped in-repo under fonts/ - reuse it here so the OLED matches the
+    # touchscreen's look rather than falling back to Pillow's generic bitmap
+    # font. Located relative to this file rather than via an env var
+    # (ZYNTHIAN_UI_DIR) so it still resolves in a plain checkout with no
+    # zynthian environment sourced.
+    FONT_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "fonts", "Audiowide", "Audiowide-Regular.ttf")
+
+    # Remaps an 8-tall x 7-wide pixel block into the packed byte layout the
+    # Fire's OLED controller expects - not row-major/page order, see the
+    # protocol doc's "Bit packing" section for where this table (and the
+    # encode loop in _encode_stripe below) comes from.
+    BIT_MUTATE = (
+        (13, 19, 25, 31, 37, 43, 49),
+        (0, 20, 26, 32, 38, 44, 50),
+        (1, 7, 27, 33, 39, 45, 51),
+        (2, 8, 14, 34, 40, 46, 52),
+        (3, 9, 15, 21, 41, 47, 53),
+        (4, 10, 16, 22, 28, 48, 54),
+        (5, 11, 17, 23, 29, 35, 55),
+        (6, 12, 18, 24, 30, 36, 42),
+    )
+
+    # The OLED goes to sleep without periodic traffic - re-send a stripe if
+    # this long has passed since it was last sent, even if unchanged
+    # (matches DrivenByMoss's own anti-sleep behavior, see the protocol doc).
+    ANTI_SLEEP_MS = 3000
+
+    def __init__(self, idev):
+        self._idev = idev
+        self._image = Image.new('1', (self.WIDTH, self.HEIGHT), 0)
+        self._draw = ImageDraw.Draw(self._image)
+        self._fonts = {}  # pixel size -> loaded ImageFont, see _font()
+        self._stripe_cache = [None] * self.STRIPES
+        self._stripe_sent_at = [0.0] * self.STRIPES
+
+    def _font(self, size):
+        """TrueType fonts (unlike Pillow's built-in bitmap default) take an
+        arbitrary pixel size directly - cache one instance per size actually
+        used rather than reloading the file every call. Falls back to the
+        built-in font if FONT_PATH is somehow missing (e.g. an install that
+        moved/renamed fonts/), rather than crashing the driver over a
+        cosmetic-only failure."""
+        font = self._fonts.get(size)
+        if font is None:
+            try:
+                font = ImageFont.truetype(self.FONT_PATH, size)
+            except OSError:
+                font = ImageFont.load_default()
+            self._fonts[size] = font
+        return font
+
+    def clear(self):
+        self._draw.rectangle((0, 0, self.WIDTH, self.HEIGHT), fill=0)
+
+    def text(self, x, y, s, size=16, center_x=False, center_y=False):
+        """Draw text with its top-left visual bbox corner at (x, y), in the
+        given pixel size. center_x/center_y ignore x/y on their respective
+        axis and center the text (by its actual rendered bbox, not the
+        font's nominal metrics) on the display instead."""
+        font = self._font(size)
+        w, h, left, top = self._text_size(font, s)
+        if center_x:
+            x = (self.WIDTH - w) // 2
+        if center_y:
+            y = (self.HEIGHT - h) // 2
+        self._draw.text((x - left, y - top), s, font=font, fill=1)
+
+    def text_fit(self, y, s, max_size, min_size=8):
+        """Center s horizontally at the largest size (<= max_size, >=
+        min_size) whose rendered width still fits within WIDTH - for a
+        label of unpredictable length (e.g. a scale name) that text()'s
+        fixed size can't be pre-sized for without risking it silently
+        running off the screen edge."""
+        size = max_size
+        while size > min_size and self._text_size(self._font(size), s)[0] > self.WIDTH:
+            size -= 1
+        self.text(0, y, s, size=size, center_x=True)
+
+    def _text_size(self, font, s):
+        """(width, height, bbox_left, bbox_top) for s in the given font -
+        textbbox() only works for TrueType fonts on some Pillow versions
+        (raises ValueError for the legacy bitmap default font _font() falls
+        back to on older Pillow), so fall back to the older getsize() API,
+        which has no bbox offset to account for."""
+        try:
+            left, top, right, bottom = self._draw.textbbox((0, 0), s, font=font)
+            return max(1, right - left), max(1, bottom - top), left, top
+        except (ValueError, AttributeError):
+            w, h = font.getsize(s)
+            return max(1, w), max(1, h), 0, 0
+
+    def update(self, force=False):
+        """Push whatever stripes changed (or are due for an anti-sleep
+        refresh) since the last call - cheap to call often; an unchanged,
+        not-yet-due stripe costs nothing but the encode-and-compare."""
+        now = time.time()
+        pixels = self._image.load()
+        for stripe in range(self.STRIPES):
+            payload = self._encode_stripe(pixels, stripe)
+            due = (now - self._stripe_sent_at[stripe]) * 1000 >= self.ANTI_SLEEP_MS
+            if not force and payload == self._stripe_cache[stripe] and not due:
+                continue
+            self._send_stripe(stripe, payload)
+            self._stripe_cache[stripe] = payload
+            self._stripe_sent_at[stripe] = now
+
+    def _encode_stripe(self, pixels, stripe):
+        payload = bytearray(self.STRIPE_SIZE)
+        base_y = stripe * self.STRIPE_HEIGHT
+        for y in range(self.STRIPE_HEIGHT):
+            row = base_y + y
+            mutate_row = self.BIT_MUTATE[y]
+            for x in range(self.WIDTH):
+                if not pixels[x, row]:
+                    continue
+                remap_bit = mutate_row[x % 7]
+                byte_idx = (x // 7) * 8 + remap_bit // 7
+                payload[byte_idx] |= 1 << (remap_bit % 7)
+        return bytes(payload)
+
+    def _send_stripe(self, stripe, payload):
+        # Byte layout: [stripe, stripe, colStart, colEnd, <147 payload bytes>]
+        # - see the protocol doc for why the stripe index is duplicated and
+        # why colStart/colEnd are always the full-width 0x00/0x7F here.
+        body = (stripe, stripe, 0x00, 0x7F) + tuple(payload)
+        msg = bytes(self.SYSEX_HEADER + (len(body) // 128, len(body) % 128) + body + (0xF7,))
+        lib_zyncore.dev_send_midi_event(self._idev, msg, len(msg))
+
+    def all_off(self):
+        self.clear()
+        self.update(force=True)
 
 
 # --------------------------------------------------------------------------
@@ -1669,22 +1837,38 @@ class StepSeqHandler(ModeHandlerBase):
 # --------------------------------------------------------------------------
 #
 # v1, deliberately minimal (more from the DrivenByMoss manual excerpt this
-# was modeled on - scale/chromatic toggle, Accent, quantize - is left for
-# later): two layouts, toggled by pressing BTN_NOTE again while already in
-# Play mode (DrivenByMoss's own convention is a double-press within a short
-# window; this driver has no double-press infra elsewhere, and "press again
-# while active" is simpler, needs no timing/threshold, and gives BTN_NOTE a
-# reason to do something when Play mode is already up, where before it did
+# was modeled on - Accent, quantize - is left for later): two layouts,
+# toggled by pressing BTN_NOTE again while already in Play mode
+# (DrivenByMoss's own convention is a double-press within a short window;
+# this driver has no double-press infra elsewhere, and "press again while
+# active" is simpler, needs no timing/threshold, and gives BTN_NOTE a reason
+# to do something when Play mode is already up, where before it did
 # nothing) - see toggle_layout(). Chromatic (the default on every fresh
-# activation): the whole grid is one contiguous 64-note run, no scale
-# constraint. Piano: two independent 2-octave-apart "bands" (rows 0-1 =
-# higher, rows 2-3 = lower), each a real white-key-row/black-key-row piano
-# layout (DrivenByMoss's actual Piano View, not just "no scale applied" -
-# our chromatic mode already has no scale, so that's not what
-# distinguishes them here). Both octave-shift via the same Select
-# knob/self._base_note. Pressing a pad plays that note on the currently
-# active chain for as long as it's held, at the velocity the pad itself
-# reports.
+# activation): the whole grid is one contiguous run through either every
+# semitone, or - if a scale is selected, see BTN_PAT_UP/DOWN/KNOB_VOLUME
+# below - every in-scale note only, in ascending pitch order; either way
+# Select still shifts by a full octave. Piano: two independent 2-octave-apart
+# "bands" (rows 0-1 = higher, rows 2-3 = lower), each a real
+# white-key-row/black-key-row piano layout (DrivenByMoss's actual Piano
+# View), deliberately NOT scale-constrained even if one is selected - a
+# scale never removes/moves any of Piano's actual piano keys, since that's
+# the whole point of it being a literal keyboard layout (unlike Chromatic,
+# which has no such fixed physical meaning to preserve). Both layouts
+# octave-shift via the same Select knob. Pressing a pad plays that note on
+# the currently active chain for as long as it's held, at the velocity the
+# pad itself reports.
+#
+# Scale/tonic (Chromatic layout only, see _midi_note/_apply_scale): BTN_PAT_UP/
+# DOWN cycle through scales.json's entries (same file, and the same 1-based
+# "scale index" convention, as StepSeqHandler._load_keymap/the pattern
+# editor's own per-pattern Scale param - see zynthian_gui_patterneditor.py's
+# load_keymap - though this is otherwise entirely independent state: Play
+# mode's scale has nothing to do with whatever's set for a specific
+# pattern), wrapping back to index 0 = Chromatic (no filter). The Volume
+# knob (repurposed here, like StepSeq repurposes all 4 knobs for its own
+# note-editing - see its own cc_change) adjusts the tonic. The OLED's second
+# line (see oled_status()) shows the current selection, e.g. "C Major", or
+# "Chromatic" - also the piece originally motivating adding the OLED at all.
 #
 # Getting a live note to actually reach an engine turned out to need real
 # JACK-level MIDI I/O, not any Python/ctypes call - see the driver's own
@@ -1739,9 +1923,9 @@ class PlayHandler(ModeHandlerBase):
 
     # DrivenByMoss's own Play mode color scheme (FireColorManager.java +
     # Scales.getColor()): white for a regular playable note, blue for every
-    # occurrence of the octave/root note (note%12==0 - we have no tonic
-    # concept since scales are skipped, so this is always relative to C),
-    # green while held, red while held AND MIDI record is armed.
+    # occurrence of the octave/root note (note%12==0 with no scale selected;
+    # the actual tonic, once one is - see _paint_pad), green while held, red
+    # while held AND MIDI record is armed.
     COLOR_OFF = (0, 0, 0)
     COLOR_NOTE = (30, 30, 30)
     COLOR_OCTAVE = (0, 0, 70)
@@ -1752,22 +1936,42 @@ class PlayHandler(ModeHandlerBase):
     # fixed, visually-distinct hue instead).
     COLOR_BLACK_KEY = (40, 0, 40)
 
-    # Piano layout: standard 7-white-key/5-black-key octave, black key
-    # "after" white column index c exists unless c%7 is E (2) or B (6) -
-    # the two places a real keyboard has no black key at all.
+    # Piano layout: standard 7-white-key/5-black-key octave. Each black pad
+    # is drawn above its UPPER white neighbor (C# above D, D# above E, F#
+    # above G, G# above A, A# above B) rather than its lower one - matches
+    # how the black keys visually lean on a real keyboard better than
+    # aligning them with the lower neighbor would. Black key "before" white
+    # column index c exists unless c%7 is C (0) or F (3) - the two places a
+    # real keyboard has no black key immediately below.
     PIANO_WHITE_OFFSETS = (0, 2, 4, 5, 7, 9, 11)   # C D E F G A B
-    PIANO_NO_BLACK_AFTER = (2, 6)                  # E, B
+    PIANO_NO_BLACK_BEFORE = (0, 3)                 # C, F
     PIANO_BAND_OFFSET = 24  # semitones between the two bands (2 octaves)
 
-    def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs, notes_queue: mp.Queue):
+    def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs, notes_queue: mp.Queue,
+                 oled_refresh_cb=None):
         super().__init__(state_manager)
         self._leds = leds
         self._pads = pads
         self._notes_queue = notes_queue  # drained by the driver's midiproc_task
+        self._oled_refresh_cb = oled_refresh_cb  # top-level driver's _refresh_oled, see _on_scale_changed
         self._zynpot = ZynpotRotate(state_manager)
+        self._knobs_ease = KnobJitterFilter()  # Volume knob only - see cc_change/_adjust_tonic
         self._base_note = self.BASE_NOTE_DEFAULT
         self._octave_step = 0   # -MAX_OCTAVE_STEPS..+MAX_OCTAVE_STEPS, see _shift_octave
         self._chromatic = True  # False = Piano layout, see toggle_layout()
+
+        # Scale/tonic - Chromatic layout only, see the class comment and
+        # _apply_scale(). Deliberately NOT reset in set_active() like
+        # _chromatic is - this is a performance setting worth keeping
+        # exactly as dialed in across leaving/re-entering Play mode, unlike
+        # the layout choice.
+        self._scale = 0    # 0 = Chromatic (no filter), else 1-based scales.json index
+        self._tonic = 0    # 0-11 = C-B
+        self._scale_keymap = None     # see _apply_scale()
+        self._scale_degree_count = 0  # notes/octave in the current scale, for _shift_octave
+        self._scale_label = "Chromatic"  # OLED status line, see oled_status()
+        self._keymap_offset = 0       # index into _scale_keymap of row=3,col=0 (lowest pad)
+
         self._play_chan = _resolve_play_midi_chan()  # refreshed in set_active(True) too
         # Pad note -> (midi note, channel) actually sounding for it - both
         # fixed at press time and reused as-is on release/panic, rather than
@@ -1799,28 +2003,41 @@ class PlayHandler(ModeHandlerBase):
         self._all_notes_off()
         self._chromatic = not self._chromatic
         self.refresh()
+        # oled_status() reads self._chromatic (Piano has no scale line) -
+        # keep the OLED in sync with the layout switch.
+        if self._oled_refresh_cb:
+            self._oled_refresh_cb()
 
     def _midi_note(self, row, col):
-        if self._chromatic:
-            return self._base_note + (3 - row) * 16 + col
-        return self._piano_note(row, col)
+        if not self._chromatic:
+            return self._piano_note(row, col)
+        idx = (3 - row) * 16 + col
+        if self._scale_keymap is not None:
+            pos = self._keymap_offset + idx
+            return self._scale_keymap[pos] if 0 <= pos < len(self._scale_keymap) else None
+        return self._base_note + idx
 
-    def _piano_note(self, row, col):
+    def _piano_note(self, row, col, base_note=None):
         """Piano layout: rows 0-1 are the higher band (0=black key row,
         1=white key row), rows 2-3 the lower band (self.PIANO_BAND_OFFSET
         semitones down) laid out the same way - see the class comment and
-        PIANO_WHITE_OFFSETS/PIANO_NO_BLACK_AFTER. Returns None for a
-        "no black key here" gap (e.g. between E and F), same as an
-        out-of-MIDI-range note - both mean "this pad plays nothing"."""
-        band_base = self._base_note if row < 2 else self._base_note - self.PIANO_BAND_OFFSET
+        PIANO_WHITE_OFFSETS/PIANO_NO_BLACK_BEFORE. Returns None for a
+        "no black key here" gap (e.g. between B and C), same as an
+        out-of-MIDI-range note - both mean "this pad plays nothing".
+        base_note overrides self._base_note - only used by
+        _piano_offset_range(), to reuse this exact mapping (rather than a
+        second, hand-derived copy of it) for _shift_base_note's bounds
+        check too."""
+        base_note = self._base_note if base_note is None else base_note
+        band_base = base_note if row < 2 else base_note - self.PIANO_BAND_OFFSET
         is_black_row = row in (0, 2)
         octave, deg = divmod(col, 7)
         white_note = band_base + octave * 12 + self.PIANO_WHITE_OFFSETS[deg]
         if not is_black_row:
             return white_note
-        if deg in self.PIANO_NO_BLACK_AFTER:
+        if deg in self.PIANO_NO_BLACK_BEFORE:
             return None
-        return white_note + 1
+        return white_note - 1
 
     def _active_channel(self):
         """self._play_chan if there's a chain that can actually take notes
@@ -1845,15 +2062,27 @@ class PlayHandler(ModeHandlerBase):
         if note_val is None or not (0 <= note_val <= 127):
             self._pads.pad_off(note_pad)
             return
+        # Root-note marker: relative to the actual tonic when a scale is
+        # active in Chromatic layout, else plain C (0) - Piano stays
+        # C-relative even with a scale selected, since it deliberately
+        # ignores scale/tonic entirely (see the class comment).
+        root = self._tonic if (self._chromatic and self._scale_keymap is not None) else 0
         if pressed:
             color = self.COLOR_RECORD if self._zynseq.libseq.isMidiRecord() else self.COLOR_PLAYED
-        elif note_val % 12 == 0:
+        elif note_val % 12 == root:
             color = self.COLOR_OCTAVE
         elif not self._chromatic and row in (0, 2):
             color = self.COLOR_BLACK_KEY
         else:
             color = self.COLOR_NOTE
         self._pads.set_pad(note_pad, *color)
+
+    def oled_status(self):
+        """Secondary OLED line while Play mode is active (see the top-level
+        driver's _refresh_oled) - current scale/tonic, e.g. 'C Major', or
+        'Chromatic'. None in Piano layout: it has no scale line to show
+        since it ignores scale/tonic entirely (see the class comment)."""
+        return self._scale_label if self._chromatic else None
 
     def _update_leds(self):
         chain = self._chain_manager.get_active_chain()
@@ -1883,16 +2112,145 @@ class PlayHandler(ModeHandlerBase):
         self._held = {}
 
     def _shift_octave(self, delta):
+        """Select knob, both layouts. Piano always shifts self._base_note
+        (_piano_note has no notion of _scale_keymap/_keymap_offset at all -
+        it's deliberately scale-blind, see the class comment) - only
+        Chromatic, and only when a scale is actually active there, shifts
+        the scale keymap offset instead. Checking self._chromatic here
+        (not just whether a scale happens to be selected) matters: without
+        it, picking a scale then switching to Piano would silently start
+        moving _keymap_offset - a field Piano never reads - leaving its own
+        _base_note-driven octave untouched and the knob looking dead."""
+        if self._chromatic and self._scale_keymap is not None:
+            self._shift_keymap_offset(delta)
+        else:
+            self._shift_base_note(delta)
+
+    def _shift_base_note(self, delta):
         new_step = self._octave_step + (1 if delta > 0 else -1)
         if not (-self.MAX_OCTAVE_STEPS <= new_step <= self.MAX_OCTAVE_STEPS):
             return
         new_base = self.BASE_NOTE_DEFAULT + new_step * 12
-        if not (0 <= new_base <= 127 - (self.TOTAL_NOTES - 1)):
+        # How far new_base can actually reach before some pad falls outside
+        # 0-127 depends on the layout - Chromatic's is a flat run
+        # (base_note .. base_note+TOTAL_NOTES-1), but Piano's is a
+        # completely different, narrower and asymmetric shape (two bands,
+        # see _piano_offset_range) - reusing Chromatic's own (0,
+        # TOTAL_NOTES-1) span for Piano too (as this used to) made it hit
+        # this "shouldn't normally trigger" safety net far sooner than
+        # Chromatic, capping Piano's actual reachable range well short of
+        # Chromatic's despite sharing the same MAX_OCTAVE_STEPS.
+        lo_off, hi_off = (0, self.TOTAL_NOTES - 1) if self._chromatic else self._piano_offset_range()
+        if not (0 <= new_base + lo_off and new_base + hi_off <= 127):
             return  # extra safety net, shouldn't trigger given MAX_OCTAVE_STEPS
         self._all_notes_off()  # avoid leaving notes stuck on under the old mapping
         self._octave_step = new_step
         self._base_note = new_base
         self.refresh()
+
+    def _piano_offset_range(self):
+        """(min, max) note offset _piano_note can ever produce relative to
+        self._base_note (queried via base_note=0, rather than hand-derived,
+        so this can't drift out of sync with _piano_note's own mapping) -
+        see _shift_base_note's bounds check, the only caller."""
+        offsets = [self._piano_note(row, col, base_note=0)
+                   for row in range(4) for col in range(16)]
+        offsets = [o for o in offsets if o is not None]
+        return min(offsets), max(offsets)
+
+    def _shift_keymap_offset(self, delta):
+        """Same idea as _shift_base_note, but for a scale-filtered
+        Chromatic layout: shifts by one octave's worth of scale degrees
+        (self._scale_degree_count) instead of a flat 12 semitones, so the
+        grid keeps landing on the same scale degree in each column after
+        the shift. Bounded directly by the keymap's own length rather than
+        a separate MAX_OCTAVE_STEPS-style cap - it's already finite (built
+        from 11 octaves clamped to 0-127, see _apply_scale). Only requires
+        the bottom-left pad to stay in range, not the whole 64-pad window -
+        same reasoning as _apply_scale's own anchor: a sparse scale (e.g.
+        pentatonic) can run out of room well before 64 pads' worth in
+        either direction, and a partially-empty window at that edge is a
+        perfectly fine state, not something to refuse reaching."""
+        step = self._scale_degree_count if delta > 0 else -self._scale_degree_count
+        new_offset = self._keymap_offset + step
+        if not (0 <= new_offset < len(self._scale_keymap)):
+            return
+        self._all_notes_off()
+        self._keymap_offset = new_offset
+        self.refresh()
+
+    def _load_scales_json(self):
+        try:
+            with open(ZYNSEQ_CONFIG_ROOT + "/scales.json") as f:
+                return json.load(f)
+        except Exception as ex:
+            logging.warning(f"PlayHandler: can't load scales.json => {ex}")
+            return []
+
+    def _cycle_scale(self, delta):
+        """BTN_PAT_UP/DOWN - cycles self._scale through 0 (Chromatic) ..
+        len(scales.json) inclusive, wrapping either way."""
+        data = self._load_scales_json()
+        self._scale = (self._scale + (1 if delta > 0 else -1)) % (len(data) + 1)
+        self._apply_scale(data)
+        self._on_scale_changed()
+
+    def _adjust_tonic(self, delta):
+        """Volume knob (repurposed here, see the class comment) - only
+        rebuilds/repaints when a scale is actually active; harmless to keep
+        tracking self._tonic even in Chromatic-no-scale/Piano so it's
+        already right if/when a scale gets picked later."""
+        self._tonic = (self._tonic + (1 if delta > 0 else -1)) % 12
+        if self._scale > 0:
+            self._apply_scale()
+            self._on_scale_changed()
+
+    def _apply_scale(self, data=None):
+        """Rebuild self._scale_keymap/_scale_degree_count/_scale_label from
+        self._scale/self._tonic, and re-anchor self._keymap_offset near
+        BASE_NOTE_DEFAULT (same idea as StepSeqHandler._load_keymap's own
+        row-window centering) - called whenever either changes. data lets
+        _cycle_scale pass along the scales.json parse it already had to do
+        anyway, to avoid reading the file twice."""
+        self._scale_keymap = None
+        self._scale_degree_count = 0
+        self._scale_label = "Chromatic"
+        if self._scale <= 0:
+            return
+        if data is None:
+            data = self._load_scales_json()
+        if not (1 <= self._scale <= len(data)):
+            self._scale = 0
+            return
+        entry = data[self._scale - 1]
+        offsets = entry["scale"]
+        keymap = [note for octave in range(11) for note in
+                  (self._tonic + off + octave * 12 for off in offsets)
+                  if 0 <= note <= 127]
+        if not keymap:
+            self._scale = 0
+            return
+        self._scale_keymap = keymap
+        self._scale_degree_count = len(offsets)
+        self._scale_label = f"{NOTE_NAMES[self._tonic]} {entry['name']}"
+        # No upper clamp against len(keymap)-TOTAL_NOTES here (unlike
+        # _shift_keymap_offset's bounds check) - a sparse scale (e.g.
+        # pentatonic) times 64 pads can span most of the MIDI range, so
+        # requiring a full 64 in-scale notes above the anchor would often
+        # force it down several octaves below BASE_NOTE_DEFAULT just to
+        # avoid empty pads at the top of the grid. Landing near
+        # BASE_NOTE_DEFAULT with some empty (silent, unlit - see
+        # _midi_note's own out-of-range handling) pads past the scale's
+        # actual top is the better default; _shift_keymap_offset separately
+        # stops you from scrolling the window into total emptiness.
+        anchor = next((i for i, n in enumerate(keymap) if n >= self.BASE_NOTE_DEFAULT), len(keymap) - 1)
+        self._keymap_offset = max(0, anchor)
+
+    def _on_scale_changed(self):
+        self._all_notes_off()  # pad->note mapping just changed
+        self.refresh()
+        if self._oled_refresh_cb:
+            self._oled_refresh_cb()
 
     def _toggle_mute(self):
         chain = self._chain_manager.get_active_chain()
@@ -1919,7 +2277,9 @@ class PlayHandler(ModeHandlerBase):
 
     def note_on(self, note, velocity, shifted_override=None):
         if note in ZYNPOT_KNOBS:
-            self._zynpot.reset(note)
+            # Volume is repurposed for tonic (see cc_change) - reset its own
+            # jitter filter on touch, not self._zynpot's (unused for it now).
+            self._knobs_ease.reset(note) if note == KNOB_VOLUME else self._zynpot.reset(note)
             return True
         if note == BTN_SELECT_PRESS:
             self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
@@ -1940,6 +2300,12 @@ class PlayHandler(ModeHandlerBase):
             return True
         if note == BTN_GRID_RIGHT:
             self._switch_chain(1)
+            return True
+        if note == BTN_PAT_UP:
+            self._cycle_scale(1)
+            return True
+        if note == BTN_PAT_DOWN:
+            self._cycle_scale(-1)
             return True
 
         if PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64:
@@ -1978,6 +2344,11 @@ class PlayHandler(ModeHandlerBase):
             delta = ccval if ccval < 64 else ccval - 128
             self._shift_octave(delta)
             return True
+        if ccnum == KNOB_VOLUME:
+            delta = self._knobs_ease.feed(ccnum, ccval)
+            if delta is not None:
+                self._adjust_tonic(delta)
+            return True
         return self._zynpot.cc_change(ccnum, ccval)
 
 
@@ -1991,7 +2362,7 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
     # reports differs from what `aconnect -l` shows (see other drivers' dev_ids for why).
     dev_ids = ["FL STUDIO FIRE", "FL STUDIO FIRE MIDI 1", "FL STUDIO FIRE IN 1"]
     driver_name = 'AKAI Fire'
-    driver_description = 'Device + Mixer + Zynpad + StepSeq + Play modes (OLED not yet implemented)'
+    driver_description = 'Device + Mixer + Zynpad + StepSeq + Play modes, OLED shows current mode'
 
     # Block only Fire's own raw channel (buttons/pads, always channel 0) from
     # reaching chains as notes - every other channel, specifically
@@ -2007,6 +2378,8 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
     def __init__(self, state_manager, idev_in, idev_out=None):
         self._leds = FeedbackLEDs(idev_out)
         self._pads = PadLEDs(idev_out)
+        self._oled = OledDisplay(idev_out)
+        self._oled_timer = IntervalTimer()  # anti-sleep keepalive, see init()/_oled_tick()
         # IPC to midiproc_task (runs in a spawned subprocess, see init_midiproc()
         # in the base class) - PlayHandler puts (status, note, vel) tuples here,
         # midiproc_task drains and emits them on its own real-time JACK port.
@@ -2015,8 +2388,17 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         self._mixer_handler = MixerHandler(state_manager, self._leds, self._pads)
         self._zynpad_handler = ZynpadHandler(state_manager, self._pads)
         self._stepseq_handler = StepSeqHandler(state_manager, self._leds, self._pads)
-        self._play_handler = PlayHandler(state_manager, self._leds, self._pads, self._play_notes_queue)
+        self._play_handler = PlayHandler(state_manager, self._leds, self._pads, self._play_notes_queue,
+                                          self._refresh_oled)
         self._current_handler = self._device_handler
+        # OLED mode-name label per handler - see _refresh_oled().
+        self._mode_labels = {
+            self._device_handler: "Device",
+            self._mixer_handler: "Mixer",
+            self._zynpad_handler: "Zynpad",
+            self._stepseq_handler: "StepSeq",
+            self._play_handler: "Play",
+        }
 
         self._is_shifted = False
         self._is_alt = False
@@ -2082,6 +2464,13 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         for zmop in range(16):
             lib_zyncore.zmop_set_route_from(zmop, self.idev, 1)
 
+        # First OLED paint, plus a periodic keepalive so it doesn't blank
+        # itself after 3s of silence (see OledDisplay.ANTI_SLEEP_MS) - the
+        # timer just calls update(), which only re-sends what's actually due,
+        # so a 1s tick is plenty responsive without being wasteful.
+        self._refresh_oled()
+        self._oled_timer.add("oled_keepalive", 1000, self._oled_tick)
+
     def end(self):
         # Safety net: guarantee any still-sounding Play-mode notes get their
         # note-off, and StepSeq's playhead poll timer stops, regardless of
@@ -2089,6 +2478,7 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         # (see PlayHandler.set_active / StepSeqHandler.set_active).
         self._play_handler.set_active(False)
         self._stepseq_handler.set_active(False)
+        self._oled_timer.remove("oled_keepalive")
         lib_zyncore.zmip_set_flag_active_chain(self.idev, 0)
         for zmop in range(16):
             lib_zyncore.zmop_set_route_from(zmop, self.idev, 0)
@@ -2193,6 +2583,35 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
     def light_off(self):
         self._leds.all_off()
         self._pads.all_off()
+        self._oled.all_off()
+
+    def _refresh_oled(self):
+        label = self._mode_labels.get(self._current_handler, "")
+        self._oled.clear()
+        # oled_status() is an optional per-handler hook (currently only
+        # PlayHandler has one, for its scale/tonic - see its own
+        # oled_status()) - a second, smaller status line under the mode
+        # name instead of the single big centered label every other mode
+        # gets.
+        get_status = getattr(self._current_handler, "oled_status", None)
+        status = get_status() if get_status is not None else None
+        if status:
+            self._oled.text(0, 4, label, size=16, center_x=True)
+            # text_fit rather than a fixed size - scale names vary a lot in
+            # length (e.g. "C Major" vs. "C# Harmonic Minor") and scales.json
+            # is a user-editable file, so there's no fixed upper bound on
+            # this string worth hardcoding a size for.
+            self._oled.text_fit(34, status, max_size=16, min_size=9)
+        else:
+            # size=24 is the largest that keeps the widest label ("StepSeq")
+            # within the 128px width with some margin - see the size-sweep
+            # measurements in this driver's own dev notes if this ever needs
+            # revisiting for a longer label.
+            self._oled.text(0, 0, label, size=24, center_x=True, center_y=True)
+        self._oled.update()
+
+    def _oled_tick(self, name):
+        self._oled.update()
 
     def midi_event(self, ev):
         evtype = (ev[0] >> 4) & 0x0F
@@ -2427,6 +2846,7 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         self._pads.all_off()
         self._current_handler.refresh()
         self._update_mode_leds()
+        self._refresh_oled()
 
     def _update_current_handler(self):
         """While screen-linked, re-derive _current_handler from
