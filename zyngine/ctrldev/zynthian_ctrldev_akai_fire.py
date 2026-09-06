@@ -27,21 +27,27 @@
 # engineered MIDI/SysEx protocol this driver is based on, including what is
 # solid vs. what still needs confirming against real hardware.
 #
-# This first version implements five modes. Four are auto-switched by the
-# current zynthian screen: "Device" (generic V5 4-knob navigation plus a full
-# pad-grid button matrix - the fallback for any screen not covered by another
-# mode, or forced on via Alt+Browser regardless of screen), "Mixer"
-# (audio_mixer screen), "Zynpad" (zynpad screen - sequence/clip launcher on
-# the pad grid), and "StepSeq" (pattern_editor screen, reached via BTN_STEP -
-# a Note Sequencer style step editor on the pad grid, see
+# This implements four pad-grid modes, plus a large set of controls that work
+# the same regardless of which one is active (or none - see below). Three
+# modes are auto-switched by the current zynthian screen: "Mixer" (audio_mixer
+# screen), "Zynpad" (zynpad screen - sequence/clip launcher on the pad grid),
+# and "StepSeq" (pattern_editor screen, reached via BTN_STEP - a Note
+# Sequencer style step editor on the pad grid, see
 # zynthian_ctrldev_akai_fire_stepseq_plan.md for the design this implements).
-# The fifth, "Play" (reached via BTN_NOTE - a chromatic note-playing keyboard
+# The fourth, "Play" (reached via BTN_NOTE - a chromatic note-playing keyboard
 # on the pad grid), has no screen of its own and is forced on/off directly
-# instead. The OLED (see OledDisplay) shows the current mode name, refreshed
-# on every mode switch - a first, deliberately trivial use of it, mainly to
-# confirm the SysEx bit-packing actually paints correctly on real hardware
-# before building anything content-richer (e.g. a scale indicator) on top of
-# it. Drum is unbound, reserved for a future mode.
+# instead. Every other zynthian screen (Admin, Preset, Control, Snapshot, main
+# menu, etc.) has no dedicated mode of its own - the pad grid just keeps
+# showing whichever of the 4 above was last active (see
+# _update_current_handler) - but transport, screen navigation (Perform, Browser,
+# Step, Alt+Note/Perform for Snapshot/ZS3, Pattern Up/Down, Grid Left/Right),
+# the Volume/Pan/Filter/Resonance/Select knobs, Select's own push, and
+# Alt+touch on any of the 4 knobs (a zynpot "switch" push) all keep working
+# regardless - see midi_event's global button handling and
+# _default_note_on/_default_cc_change for the shared fallbacks every mode
+# (including no mode) falls back to. The OLED (see OledDisplay) shows the
+# current mode name (blank when there isn't one), refreshed on every mode
+# switch. Drum is unbound, reserved for a future mode.
 #
 # ******************************************************************************
 
@@ -70,10 +76,13 @@ EV_CC = 0x0B
 EV_SYSEX = 0xF0
 
 # Buttons (Note On/Off, channel 0)
-# Capacitive touch on the 4 channel-strip knobs - documented but currently
-# unused: touch fires on any contact (e.g. just resting a finger on the knob
-# to turn it), so it can't reliably stand in for a deliberate press. Solo 1-4
-# are used instead (see DeviceHandler.ZYNPOT_SWITCH_BTNS).
+# Capacitive touch on the 4 channel-strip knobs - note numbers coincide with
+# their own CC numbers. Plain touch just resets that knob's easing
+# accumulator (see e.g. ZynpotRotate.reset()); Alt+touch is a deliberate
+# zynpot "switch" push instead (see midi_event's ZYNPOT_KNOBS handling) -
+# touch alone can't reliably stand in for a press (fires on any contact,
+# e.g. just resting a finger while turning the knob), so Alt makes it a
+# two-hand gesture instead of incidental.
 BTN_VOLUME_TOUCH = 0x10
 BTN_PAN_TOUCH = 0x11
 BTN_FILTER_TOUCH = 0x12
@@ -95,7 +104,7 @@ BTN_DRUM = 0x2E		# unbound for now, reserved for a future drum mode
 BTN_PERFORM = 0x2F		# toggles between the Mixer and Zynpad screens
 BTN_SHIFT = 0x30
 BTN_ALT = 0x31
-BTN_PATTERN_SONG = 0x32	# unbound for now
+BTN_PATTERN_SONG = 0x32	# labelled "Metronome" in DrivenByMoss - see midi_event
 BTN_PLAY = 0x33
 BTN_STOP = 0x34
 BTN_RECORD = 0x35
@@ -161,6 +170,7 @@ LED_SOLO_3 = 0x2A
 LED_SOLO_4 = 0x2B
 LED_BROWSER = BTN_BROWSER
 LED_PERFORM = BTN_PERFORM
+LED_SHIFT = BTN_SHIFT
 
 # Button LED color values, confirmed from the SEGGER blog's decoding series
 # (see "Color palette" in zynthian_ctrldev_akai_fire_protocol.md). Each button
@@ -203,42 +213,22 @@ def _pad(row, col):
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 
 
-# Device-mode button matrix, hosted on the otherwise-idle pad grid - mirrors
-# zynthian_ctrldev_akai_apc_key25_mk2.py's DeviceHandler pad layout, adapted to
-# Fire's 4 rows (APC's equivalent uses 5):
-#   row 0: screen-access (Admin, Mixer, Preset, ZS3), Metronome, Zynseq
-#   row 1: Alt, Play, Stop, Record, F1-F4
-#   rows 2-3: 2x3 direction block - [Back/No, Up, Sel/Yes] over [Left, Down, Right],
-#             same shape as APC's own BACK_NO/UP/SEL_YES over LEFT/DOWN/RIGHT block
-PAD_ADMIN = _pad(0, 0)
-PAD_MIXER = _pad(0, 1)
-PAD_PRESET = _pad(0, 2)
-PAD_ZS3 = _pad(0, 3)
-PAD_METRONOME = _pad(0, 4)
-PAD_ZYNSEQ = _pad(0, 5)
-
-PAD_ALT = _pad(1, 0)
-PAD_PLAY = _pad(1, 1)
-PAD_STOP = _pad(1, 2)
-PAD_RECORD = _pad(1, 3)
-PAD_F1 = _pad(1, 4)
-PAD_F2 = _pad(1, 5)
-PAD_F3 = _pad(1, 6)
-PAD_F4 = _pad(1, 7)
-
-PAD_BACK = _pad(2, 0)
-PAD_UP = _pad(2, 1)
-PAD_SELECT = _pad(2, 2)
-PAD_LEFT = _pad(3, 0)
-PAD_DOWN = _pad(3, 1)
-PAD_RIGHT = _pad(3, 2)
-
-
 def _alt_mode():
     """Zynthian's persistent, global "alt mode" toggle (Bank/Mode button /
     TOGGLE_ALT_MODE CUIA, see zyngui/zynthian_gui.py's alt_mode attribute) -
     read live from the GUI singleton rather than tracked locally per-handler,
     so it can't go stale if toggled some other way than through this driver.
+    Fire's own Shift button (BTN_SHIFT) is wired to the exact same toggle -
+    see midi_event's BTN_SHIFT handling - rather than tracking its own
+    separate "shifted" boolean, so Shift is naturally sticky (a press flips
+    this and it stays flipped, like DrivenByMoss's Fire implementation, as
+    opposed to a momentary hold) and Shift/Bank can never disagree about the
+    current state, since they're both just alternate ways to read/flip this
+    one value. Every "shifted"
+    modifier check across all handlers (Mixer's Shift+Solo-N mute, Zynpad's
+    Shift+Pad, StepSeq/PlayHandler's Shift+Grid/Pattern combos, etc.) is
+    forwarded this same live value on every button press - see midi_event's
+    two _current_handler.note_on/note_off calls - not a locally-cached one.
     NOT the same thing as momentarily holding Fire's own physical Alt button
     (BTN_ALT) - that's a separate, unrelated modifier (see e.g. Alt+Solo-N in
     MixerHandler). zyngui can still be None here: driver loading is
@@ -280,7 +270,7 @@ class FeedbackLEDs:
         self.control_leds_off()
 
     def control_leds_off(self):
-        for led in (LED_BANK, LED_SOLO_1, LED_SOLO_2, LED_SOLO_3, LED_SOLO_4, LED_BROWSER, LED_PERFORM):
+        for led in (LED_BANK, LED_SOLO_1, LED_SOLO_2, LED_SOLO_3, LED_SOLO_4, LED_BROWSER, LED_PERFORM, LED_SHIFT):
             self.led_off(led)
 
     def led_off(self, led):
@@ -513,10 +503,14 @@ class KnobJitterFilter:
 
 
 # --------------------------------------------------------------------------
-# Volume/Pan/Filter/Resonance knob rotate -> zynpot 0-3. The default any mode
-# falls back to when it has no more specific use for these 4 knobs (currently
-# DeviceHandler and ZynpadHandler) - composed, not inherited, so each handler
-# still owns its own note_on/cc_change and just delegates knob handling here.
+# Volume/Pan/Filter/Resonance knob rotate -> zynpot 0-3. A single shared
+# instance lives on the top-level driver (see _default_cc_change) and is
+# used whenever the active mode has no more specific use for a given knob
+# (its own cc_change/note_on decline by returning falsy) - including
+# whatever screen has no dedicated mode of its own at all, now that
+# DeviceHandler is gone. PlayHandler is the only handler with any bespoke
+# use left for one of these 4 (Volume, repurposed for tonic) - the other 3
+# fall through to this same shared default there too.
 # --------------------------------------------------------------------------
 class ZynpotRotate:
     def __init__(self, state_manager):
@@ -537,250 +531,24 @@ class ZynpotRotate:
         self._knobs_ease.reset(ccnum)
 
 
-def _select_knob_arrow(state_manager, ccval):
-    """Select knob rotate -> ARROW_LEFT/RIGHT, the default left/right
-    list-navigation any mode falls back to when it has no more specific use
-    for the Select knob (currently DeviceHandler and ZynpadHandler;
-    MixerHandler keeps its own specialized raw chain-scroll instead - see
-    its cc_change). Select's own encoder isn't noisy like the other 4, so
-    no jitter filter here either - same as MixerHandler's."""
+def _select_knob_arrow(state_manager, ccval, is_alt=False):
+    """Select knob rotate -> ARROW_UP/DOWN by default (most zynthian menus
+    are vertical lists), Alt+rotate -> ARROW_LEFT/RIGHT instead - the
+    default list-navigation any mode falls back to when it has no more
+    specific use for the Select knob - called from the top-level driver's
+    own _default_cc_change, same shared-fallback story as ZynpotRotate
+    above. Mixer/StepSeq/Play all keep their own specialized use of Select
+    instead (chain-scroll, pitch-adjust, octave-shift respectively - see
+    each one's own cc_change) and never reach this. Select's own encoder
+    isn't noisy like the other 4, so no jitter filter here either."""
     delta = ccval if ccval < 64 else ccval - 128
-    state_manager.send_cuia("ARROW_RIGHT" if delta > 0 else "ARROW_LEFT")
-
-
-# --------------------------------------------------------------------------
-# Handle GUI (generic screen navigation, active outside the audio mixer)
-# --------------------------------------------------------------------------
-class DeviceHandler(ModeHandlerBase):
-
-    # zynpot "switch" (push) actions use the Solo buttons instead of knob touch:
-    # touch is capacitive and fires on any contact (including just resting a
-    # finger on the knob to turn it), so it can't stand in for a deliberate
-    # press - Solo 1-4 give a real momentary button, same physical buttons
-    # already doing solo/mute duty in Mixer mode.
-    ZYNPOT_SWITCH_BTNS = {
-        BTN_SOLO_1: 0,
-        BTN_SOLO_2: 1,
-        BTN_SOLO_3: 2,
-        BTN_SOLO_4: 3,
-    }
-
-    # Screen-access pads: each cycles through a tuple of related CUIAs on
-    # repeated short press, jumps to the "secondary" one on bold press - same
-    # pattern as zynthian_ctrldev_akai_apc_key25_mk2.py's DeviceHandler.
-    PAD_ACTIONS = {
-        PAD_ADMIN: ("MENU", "SCREEN_ADMIN"),
-        PAD_MIXER: ("SCREEN_AUDIO_MIXER", "SCREEN_ALSA_MIXER"),
-        PAD_PRESET: ("SCREEN_CONTROL", "PRESET", "SCREEN_BANK"),
-        PAD_ZS3: ("SCREEN_ZS3", "SCREEN_SNAPSHOT"),
-        PAD_ZYNSEQ: ("SCREEN_ZYNPAD", "SCREEN_PATTERN_EDITOR"),
-    }
-
-    # Long-press shortcuts on those same pads, again matching APC's DeviceHandler.
-    PAD_LONG_ACTIONS = {
-        PAD_ADMIN: "POWER_OFF",
-        PAD_PRESET: "PRESET_FAV",
-        PAD_ZYNSEQ: "SCREEN_ARRANGER",
-    }
-
-    # Which screen lights up which screen-access pad (and at what state index,
-    # so a following short press cycles on from there) - kept in sync via
-    # on_screen_change(), called even while this handler isn't the active one.
-    SCREEN_MAP = {
-        "option":         (PAD_ADMIN, 0),
-        "main_menu":      (PAD_ADMIN, 0),
-        "admin":          (PAD_ADMIN, 1),
-        "audio_mixer":    (PAD_MIXER, 0),
-        "alsa_mixer":     (PAD_MIXER, 1),
-        "control":        (PAD_PRESET, 0),
-        "engine":         (PAD_PRESET, 0),
-        "preset":         (PAD_PRESET, 1),
-        "bank":           (PAD_PRESET, 2),
-        "zs3":            (PAD_ZS3, 0),
-        "snapshot":       (PAD_ZS3, 1),
-        "zynpad":         (PAD_ZYNSEQ, 0),
-        "pattern_editor": (PAD_ZYNSEQ, 1),
-        "arranger":       (PAD_ZYNSEQ, 1),
-    }
-
-    # F1-F4 -> PROGRAM_CHANGE 1-4 (or 5-8 if alt is active), matching APC.
-    FUNCTION_PADS = {
-        PAD_F1: 1,
-        PAD_F2: 2,
-        PAD_F3: 3,
-        PAD_F4: 4,
-    }
-
-    # Pads whose press needs short/bold/long distinction (routed through
-    # _btn_timer); everything else is a direct single-action press.
-    TIMED_PADS = {PAD_ADMIN, PAD_MIXER, PAD_PRESET, PAD_ZS3, PAD_ZYNSEQ, PAD_PLAY, PAD_STOP}
-
-    # Fixed dim colors for the non-screen-access pads (PAD_ALT excluded - it's
-    # painted separately in refresh(), reflecting on/off state). Real RGB, no
-    # palette uncertainty here (unlike the button CCs).
-    STATIC_PAD_COLORS = {
-        PAD_METRONOME: (0, 40, 40),
-        PAD_PLAY: (0, 50, 0),
-        PAD_STOP: (50, 20, 0),
-        PAD_RECORD: (60, 0, 0),
-        PAD_F1: (30, 30, 30),
-        PAD_F2: (30, 30, 30),
-        PAD_F3: (30, 30, 30),
-        PAD_F4: (30, 30, 30),
-        PAD_BACK: (60, 0, 0),
-        PAD_UP: (40, 40, 0),
-        PAD_SELECT: (0, 60, 0),
-        PAD_LEFT: (40, 40, 0),
-        PAD_DOWN: (40, 40, 0),
-        PAD_RIGHT: (40, 40, 0),
-    }
-
-    # 3-state coloring for screen-access pads, same scheme as APC's DeviceHandler
-    # (COLOR_STATE_0/1/2: unselected / primary-selected / secondary-selected),
-    # shared across all 5 pads rather than a per-pad hue.
-    PAD_STATE_UNSELECTED = (0, 0, 40)   # dim blue, ~ APC's COLOR_STATE_0
-    PAD_STATE_PRIMARY = (0, 60, 0)      # green, ~ APC's COLOR_STATE_1
-    PAD_STATE_SECONDARY = (60, 30, 0)   # orange, ~ APC's COLOR_STATE_2
-
-    def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs):
-        super().__init__(state_manager)
-        self._leds = leds
-        self._pads = pads
-        self._btn_timer = ButtonTimer(self._handle_timed_button)
-        self._zynpot = ZynpotRotate(state_manager)
-        self._pad_states = {k: -1 for k in self.PAD_ACTIONS}
-
-    def _pad_state_color(self, state):
-        if state < 0:
-            return self.PAD_STATE_UNSELECTED
-        if state == 0:
-            return self.PAD_STATE_PRIMARY
-        return self.PAD_STATE_SECONDARY
-
-    def refresh(self):
-        self._leds.led_on(LED_BANK) if _alt_mode() else self._leds.led_off(LED_BANK)
-
-        for note, rgb in self.STATIC_PAD_COLORS.items():
-            self._pads.set_pad(note, *rgb)
-        # PAD_ALT reflects on/off, same as the Bank/Mode LED
-        self._pads.set_pad(PAD_ALT, *((40, 0, 40) if _alt_mode() else (0, 0, 40)))
-
-        for note in self.PAD_ACTIONS:
-            self._pads.set_pad(note, *self._pad_state_color(self._pad_states[note]))
-
-    def on_screen_change(self, screen):
-        super().on_screen_change(screen)
-        self._pad_states = {k: -1 for k in self._pad_states}
-        pad_state = self.SCREEN_MAP.get(screen)
-        if pad_state is not None:
-            pad, idx = pad_state
-            self._pad_states[pad] = idx
-
-    def note_on(self, note, velocity, shifted_override=None):
-        if note in self.ZYNPOT_SWITCH_BTNS or note in self.TIMED_PADS:
-            self._btn_timer.is_pressed(note, time.time())
-            return True
-
-        # Knob touch note numbers coincide with their CC numbers - use touch
-        # only to start each turn with a clean accumulator (no leftover bias
-        # from a previous turn), not as a button press (see comment above
-        # BTN_VOLUME_TOUCH).
-        if note in ZYNPOT_KNOBS:
-            self._zynpot.reset(note)
-            return True
-
-        if note == BTN_PAT_UP:
-            self._state_manager.send_cuia("ARROW_UP")
-        elif note == BTN_PAT_DOWN:
-            self._state_manager.send_cuia("ARROW_DOWN")
-        elif note == BTN_GRID_LEFT:
-            self._state_manager.send_cuia("ARROW_LEFT")
-        elif note == BTN_GRID_RIGHT:
-            self._state_manager.send_cuia("ARROW_RIGHT")
-        elif note == PAD_ALT:
-            # BTN_BANK (the physical button) does the same thing globally -
-            # see midi_event - this is just a second way to reach it while
-            # the pad grid already shows Device mode.
-            _toggle_alt_mode()
-            self.refresh()
-        elif note == PAD_METRONOME:
-            self._state_manager.send_cuia("TEMPO")
-        elif note == PAD_RECORD:
-            self._state_manager.send_cuia("TOGGLE_RECORD")
-        elif note == PAD_BACK:
-            self._state_manager.send_cuia("BACK")
-        elif note == PAD_SELECT:
-            self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
-        elif note == BTN_SELECT_PRESS:
-            # Same action as PAD_SELECT above - the physical Select knob's
-            # own push is just a second way to reach it.
-            self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
-        elif note == PAD_UP:
-            self._state_manager.send_cuia("ARROW_UP")
-        elif note == PAD_DOWN:
-            self._state_manager.send_cuia("ARROW_DOWN")
-        elif note == PAD_LEFT:
-            self._state_manager.send_cuia("ARROW_LEFT")
-        elif note == PAD_RIGHT:
-            self._state_manager.send_cuia("ARROW_RIGHT")
-        elif note in self.FUNCTION_PADS:
-            pgm = self.FUNCTION_PADS[note] + (4 if _alt_mode() else 0)
-            self._state_manager.send_cuia("PROGRAM_CHANGE", [pgm])
-        else:
-            return False
-        return True
-
-    def note_off(self, note, shifted_override=None):
-        self._btn_timer.is_released(note)
-
-    def cc_change(self, ccnum, ccval):
-        if ccnum == KNOB_SELECT:
-            _select_knob_arrow(self._state_manager, ccval)
-            return True
-        return self._zynpot.cc_change(ccnum, ccval)
-
-    def _handle_timed_button(self, btn, press_type):
-        if press_type == CONST.PT_LONG:
-            cuia = self.PAD_LONG_ACTIONS.get(btn)
-            if cuia:
-                self._state_manager.send_cuia(cuia)
-            return True
-
-        zynpot = self.ZYNPOT_SWITCH_BTNS.get(btn)
-        if zynpot is not None:
-            if press_type == CONST.PT_SHORT:
-                self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [zynpot, 'S'])
-            elif press_type == CONST.PT_BOLD:
-                self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [zynpot, 'B'])
-            return True
-
-        if btn == PAD_PLAY:
-            if press_type == CONST.PT_BOLD:
-                self._state_manager.send_cuia("AUDIO_FILE_LIST")
-            else:
-                self._state_manager.send_cuia("TOGGLE_PLAY")
-            return True
-
-        if btn == PAD_STOP:
-            if press_type == CONST.PT_BOLD:
-                self._state_manager.send_cuia("ALL_SOUNDS_OFF")
-            else:
-                self._state_manager.send_cuia("STOP")
-            return True
-
-        actions = self.PAD_ACTIONS.get(btn)
-        if actions is None:
-            return
-
-        idx = -1
-        if press_type == CONST.PT_SHORT:
-            idx = (self._pad_states[btn] + 1) % len(actions)
-        elif press_type == CONST.PT_BOLD:
-            idx = 1 if len(actions) > 1 else 0
-        cuia = actions[idx]
-
-        self._state_manager.send_cuia(cuia)
-        return True
+    if is_alt:
+        state_manager.send_cuia("ARROW_RIGHT" if delta > 0 else "ARROW_LEFT")
+    else:
+        # Inverted relative to Left/Right's own sign convention above -
+        # confirmed on real hardware: clockwise (positive delta) reads as
+        # "up" through a vertical list, not "down".
+        state_manager.send_cuia("ARROW_UP" if delta > 0 else "ARROW_DOWN")
 
 
 # --------------------------------------------------------------------------
@@ -1025,8 +793,9 @@ class MixerHandler(ModeHandlerBase):
     def note_on(self, note, velocity, shifted_override=None):
         self._on_shifted_override(shifted_override)
 
-        # Same touch-resets-accumulator trick as DeviceHandler (Volume/Pan only
-        # here - Filter/Resonance aren't used in Mixer mode, Select has no touch).
+        # Touch just resets this knob's own easing accumulator (Volume/Pan
+        # only - Filter/Resonance aren't used in Mixer mode, so they decline
+        # and fall to the top-level driver's own shared default instead).
         if note in (KNOB_VOLUME, KNOB_PAN):
             self._knobs_ease.reset(note)
             return True
@@ -1071,10 +840,8 @@ class MixerHandler(ModeHandlerBase):
             self.refresh()
             return True
 
-        if note == BTN_SELECT_PRESS:
-            self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
-            return True
-
+        # No specific use for Select's own push here - declines to the
+        # top-level driver's own default (zynpot switch 3).
         return False
 
     def note_off(self, note, shifted_override=None):
@@ -1221,9 +988,10 @@ class ZynpadHandler(ModeHandlerBase):
         super().__init__(state_manager)
         self._pads = pads
         self._libseq = self._zynseq.libseq
-        # No zynpad-specific use for the 4 knobs yet - default to the same
-        # zynpot navigation as Device mode rather than leaving them dead.
-        self._zynpot = ZynpotRotate(state_manager)
+        # No zynpad-specific use for the 4 knobs/Select/its own push - just
+        # decline them (base class no-ops) and let the top-level driver's own
+        # shared default handle them, same as every screen with no dedicated
+        # mode of its own (see midi_event's _default_cc_change/_default_note_on).
 
     @staticmethod
     def _logical_xy(phys_col, phys_row):
@@ -1285,12 +1053,11 @@ class ZynpadHandler(ModeHandlerBase):
     def note_on(self, note, velocity, shifted_override=None):
         self._on_shifted_override(shifted_override)
 
-        if note in ZYNPOT_KNOBS:
-            self._zynpot.reset(note)
-            return True
-        if note == BTN_SELECT_PRESS:
-            self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
-            return True
+        if not (PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64):
+            # Not a pad - knob touch, Select push, etc. - nothing
+            # zynpad-specific for any of those, decline and let the
+            # top-level driver's own default handle it.
+            return False
 
         index = note - PAD_NOTE_BASE
         row, col = index // 16, index % 16
@@ -1314,11 +1081,8 @@ class ZynpadHandler(ModeHandlerBase):
         self._libseq.togglePlayState(self._zynseq.bank, seq)
         return True
 
-    def cc_change(self, ccnum, ccval):
-        if ccnum == KNOB_SELECT:
-            _select_knob_arrow(self._state_manager, ccval)
-            return True
-        return self._zynpot.cc_change(ccnum, ccval)
+    # No cc_change override - nothing zynpad-specific for the 4 knobs or
+    # Select either, base class declines everything (see note_on above).
 
 
 # zynseq keymaps live here on a real box (see zynthian_gui_patterneditor.py's
@@ -1869,10 +1633,10 @@ class StepSeqHandler(ModeHandlerBase):
             self._knobs_ease.reset(note)
             return True
         if note == BTN_SELECT_PRESS:
-            # No literal "Back" button on Fire (Device mode's is a borrowed
-            # grid pad, unavailable here - the whole grid is note cells) -
-            # Select's own push is otherwise unbound in this mode, so it
-            # clears the selection instead.
+            # Plain press only - Alt+Select-push is BACK globally (see
+            # midi_event, checked before dispatch ever reaches here). Select's
+            # own plain push is otherwise unbound in this mode, so it clears
+            # the selection instead.
             self._selected_notes.clear()
             self._paint_all()
             return True
@@ -2027,9 +1791,9 @@ class StepSeqHandler(ModeHandlerBase):
 # out of chain routing while leaving every other channel (specifically
 # PLAY_MIDI_CHAN) open.
 #
-# Unlike Device/Mixer/Zynpad/StepSeq, this mode has no screen of its own to
-# be screen-linked to - see BTN_NOTE in midi_event, it force-activates and
-# unlinks, same as Alt+Perform does for Device mode.
+# Unlike Mixer/Zynpad/StepSeq, this mode has no screen of its own to be
+# screen-linked to - see BTN_NOTE in midi_event, it force-activates and
+# unlinks instead.
 class PlayHandler(ModeHandlerBase):
 
     BASE_NOTE_DEFAULT = 36   # matches DrivenByMoss PianoView's own default
@@ -2075,7 +1839,6 @@ class PlayHandler(ModeHandlerBase):
         self._pads = pads
         self._notes_queue = notes_queue  # drained by the driver's midiproc_task
         self._oled_refresh_cb = oled_refresh_cb  # top-level driver's _refresh_oled, see _on_scale_changed
-        self._zynpot = ZynpotRotate(state_manager)
         self._knobs_ease = KnobJitterFilter()  # Volume knob only - see cc_change/_adjust_tonic
         self._base_note = self.BASE_NOTE_DEFAULT
         self._octave_step = 0   # -MAX_OCTAVE_STEPS..+MAX_OCTAVE_STEPS, see _shift_octave
@@ -2397,13 +2160,12 @@ class PlayHandler(ModeHandlerBase):
         self._update_leds()
 
     def note_on(self, note, velocity, shifted_override=None):
-        if note in ZYNPOT_KNOBS:
-            # Volume is repurposed for tonic (see cc_change) - reset its own
-            # jitter filter on touch, not self._zynpot's (unused for it now).
-            self._knobs_ease.reset(note) if note == KNOB_VOLUME else self._zynpot.reset(note)
-            return True
-        if note == BTN_SELECT_PRESS:
-            self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
+        if note == KNOB_VOLUME:
+            # Repurposed for tonic (see cc_change) - reset its own jitter
+            # filter on touch. Pan/Filter/Resonance have no use here - decline
+            # (return False below) and let the top-level driver's shared
+            # default reset theirs instead.
+            self._knobs_ease.reset(note)
             return True
         if note == BTN_SOLO_1:
             # No specific "stop" target here (unlike StepSeq's Solo1) - a
@@ -2470,7 +2232,9 @@ class PlayHandler(ModeHandlerBase):
             if delta is not None:
                 self._adjust_tonic(delta)
             return True
-        return self._zynpot.cc_change(ccnum, ccval)
+        # Pan/Filter/Resonance have no use here - decline, top-level driver's
+        # shared default (ZynpotRotate) picks them up instead.
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -2483,7 +2247,7 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
     # reports differs from what `aconnect -l` shows (see other drivers' dev_ids for why).
     dev_ids = ["FL STUDIO FIRE", "FL STUDIO FIRE MIDI 1", "FL STUDIO FIRE IN 1"]
     driver_name = 'AKAI Fire'
-    driver_description = 'Device + Mixer + Zynpad + StepSeq + Play modes, OLED shows current mode'
+    driver_description = 'Mixer + Zynpad + StepSeq + Play modes, OLED shows current mode'
 
     # Block only Fire's own raw channel (buttons/pads, always channel 0) from
     # reaching chains as notes - every other channel, specifically
@@ -2505,25 +2269,55 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         # in the base class) - PlayHandler puts (status, note, vel) tuples here,
         # midiproc_task drains and emits them on its own real-time JACK port.
         self._play_notes_queue = mp.Queue()
-        self._device_handler = DeviceHandler(state_manager, self._leds, self._pads)
         self._mixer_handler = MixerHandler(state_manager, self._leds, self._pads)
         self._zynpad_handler = ZynpadHandler(state_manager, self._pads)
         self._stepseq_handler = StepSeqHandler(state_manager, self._leds, self._pads, self._refresh_oled)
         self._play_handler = PlayHandler(state_manager, self._leds, self._pads, self._play_notes_queue,
                                           self._refresh_oled)
-        self._current_handler = self._device_handler
+        # Mixer is the default/fallback mode: whatever screen has no
+        # dedicated mode of its own (Admin, Preset, Control, Snapshot, main
+        # menu, etc., now that DeviceHandler is gone) just keeps showing
+        # whichever of the 4 real modes was already active rather than
+        # switching to anything - see _update_current_handler()'s "no match"
+        # case. Mixer is only actually picked here as the very first value,
+        # before any real screen has been seen yet.
+        self._current_handler = self._mixer_handler
+        # Knobs/Select/Select-push are a SEPARATE concern from the pad grid
+        # above - _current_handler deliberately goes stale on a screen with
+        # no dedicated mode (see above), but a stale mode's own knob logic
+        # (e.g. Mixer's chain volume) must NOT keep running invisibly while
+        # an unrelated screen (Preset, Admin, Snapshot, ...) is actually
+        # showing - that looks exactly like "the knobs stopped doing
+        # anything" (found on real hardware). self._null_handler - a bare
+        # ModeHandlerBase instance that declines everything (every method is
+        # a no-op/returns None) - stands in for "no mode-specific knob
+        # behavior right now", forcing _default_cc_change/_default_note_on
+        # to run instead. Kept in sync with _current_handler by
+        # _set_current_handler() whenever pads actually switch to a real
+        # mode; _update_current_handler()'s "no match" case is the only
+        # place they deliberately diverge (pads stay stale, knobs go null).
+        self._null_handler = ModeHandlerBase(state_manager)
+        self._knobs_handler = self._mixer_handler
+        self._default_zynpot = ZynpotRotate(state_manager)
         # OLED mode-name label per handler - see _refresh_oled().
         self._mode_labels = {
-            self._device_handler: "Device",
             self._mixer_handler: "Mixer",
             self._zynpad_handler: "Zynpad",
             self._stepseq_handler: "StepSeq",
             self._play_handler: "Play",
         }
 
-        self._is_shifted = False
+        # Shift itself has no local state to track any more - it's just a
+        # second way to flip zynthian's own persistent alt_mode, see
+        # _alt_mode()'s docstring - so only Alt (still a momentary hold)
+        # needs tracking here.
         self._is_alt = False
         self._btn_timer = ButtonTimer(self._handle_timed_button)
+        # Notes currently being timed as an Alt+touch zynpot push (see
+        # midi_event's ZYNPOT_KNOBS handling) - tracked by note rather than
+        # re-checking self._is_alt on release, since Alt may already have
+        # been released while the knob is still held.
+        self._zynpot_touch_active = set()
 
         # The active mode is normally picked automatically from the current
         # screen (see _update_current_handler), but Alt+Browser can unlink
@@ -2546,9 +2340,9 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
     def init(self):
         # The pad grid is the device's own SysEx-set memory, independent of
         # this driver's state - it can carry stale colors from a previous
-        # session/mode across a reload. _update_current_handler()'s clear
-        # only fires on an actual handler *change*, which never happens right
-        # at startup (_current_handler is already _device_handler from
+        # session/mode across a reload. _set_current_handler()'s clear only
+        # fires on an actual handler *change*, which never happens right at
+        # startup (_current_handler is already _mixer_handler from
         # construction), so clear unconditionally here before anything below
         # (via super().init() -> refresh()) paints the real starting state.
         self._pads.all_off()
@@ -2684,6 +2478,10 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         self._update_mode_leds()
 
     def _update_mode_leds(self):
+        # Shift mirrors zynthian's own persistent alt_mode toggle - see
+        # _alt_mode()'s docstring - lit whenever it's on, off otherwise.
+        self._leds.led_on(LED_SHIFT, LED_YR_HIGH_YELLOW) if _alt_mode() else self._leds.led_off(LED_SHIFT)
+
         # Browser (red-only): repurposed as a screen-link indicator - lit
         # whenever unlinked, as a reminder the Fire's mode won't follow
         # screen changes until Alt+Browser re-links it.
@@ -2691,9 +2489,8 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             else self._leds.led_off(LED_BROWSER)
 
         # Perform (yellow-red): red in Mixer mode, yellow in Zynpad mode, off
-        # in Device/StepSeq/Play mode (Perform only toggles between the two
-        # "performance" screens - see BTN_PERFORM - neither is part of that
-        # toggle).
+        # otherwise (Perform only toggles between the two "performance"
+        # screens - see BTN_PERFORM - nothing else is part of that toggle).
         if self._current_handler is self._mixer_handler:
             self._leds.led_on(LED_PERFORM, LED_YR_HIGH_RED)
         elif self._current_handler is self._zynpad_handler:
@@ -2761,14 +2558,19 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             vel = ev[2] & 0x7F
 
             if note == BTN_SHIFT:
-                self._is_shifted = True
-                self._mixer_handler.on_shift_changed(True)
+                # Sticky (toggle), not momentary - see _alt_mode()'s
+                # docstring. self.refresh() updates Shift's own LED
+                # (_update_mode_leds) plus whatever the current handler
+                # shows for alt_mode (e.g. Mixer's volume-vs-balance view).
+                _toggle_alt_mode()
+                self._mixer_handler.on_shift_changed(_alt_mode())
+                self.refresh()
                 return True
             if note == BTN_ALT:
                 self._is_alt = True
-                # Alt+Browser (screen-link toggle) and Alt+Perform (jump to
-                # Device) work from any mode, so _is_alt itself is tracked
-                # unconditionally above - but only forward into MixerHandler
+                # Alt+Browser (screen-link toggle), Alt+Note (Snapshot) and
+                # Alt+Perform (ZS3) work from any mode, so _is_alt itself is
+                # tracked unconditionally above - but only forward into MixerHandler
                 # (its Alt+Solo-N = toggle solo modifier) or StepSeqHandler
                 # (its Alt+Filter = play chance modifier) while one of them
                 # is actually the active mode.
@@ -2789,10 +2591,18 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 # screen-follow (_update_current_handler) pick up StepSeq if
                 # linked. SCREEN_PATTERN_EDITOR itself resolves "which
                 # pattern" from zynpad's currently selected sequence (same as
-                # pressing Zynseq from Device mode, or the touchscreen).
+                # pressing Shift+Pad in Zynpad mode, or the touchscreen).
                 self.state_manager.send_cuia("SCREEN_PATTERN_EDITOR")
                 return True
             if note == BTN_NOTE:
+                if self._is_alt:
+                    # Snapshot access - screen-driven like BTN_STEP just
+                    # above, so no forcing/unlinking: screen-follow
+                    # (_update_current_handler) leaves _current_handler as-is,
+                    # since "snapshot" has no dedicated mode of its own - the
+                    # pad grid just keeps showing whatever it already did.
+                    self.state_manager.send_cuia("SCREEN_SNAPSHOT")
+                    return True
                 if self._current_handler is self._play_handler:
                     # Already active - a second press cycles the layout
                     # (Chromatic <-> Piano) instead of doing nothing.
@@ -2800,22 +2610,20 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 else:
                     # Unlike the other modes, Play has no screen of its own
                     # to be screen-linked to - force it on directly and
-                    # unlink, same as Alt+Perform does for Device mode, so
-                    # it sticks regardless of the touchscreen.
+                    # unlink so it sticks regardless of the touchscreen.
                     self._screen_linked = False
                     self._set_current_handler(self._play_handler)
                     self._update_mode_leds()
                 return True
             if note == BTN_PERFORM:
                 if self._is_alt:
-                    # Straight to Device mode, unlinking if needed so it
-                    # sticks regardless of subsequent screen changes. Same
-                    # caveat as BTN_BROWSER above: _set_current_handler()
-                    # only refreshes LEDs on an actual handler change, so
-                    # the link-status LED needs an explicit update too.
-                    self._screen_linked = False
-                    self._set_current_handler(self._device_handler)
-                    self._update_mode_leds()
+                    # ZS3 access - Alt+Note above is Snapshot, its neighbor in
+                    # the same "recall a saved state" family (see the
+                    # akai_fire_stepseq_plan.md discussion for how this
+                    # pairing settled). This used to jump straight to Device
+                    # mode instead; screen-driven now, like everything else
+                    # here - no forcing/unlinking needed.
+                    self.state_manager.send_cuia("SCREEN_ZS3")
                 elif self._current_handler is self._play_handler:
                     # Same reasoning as BTN_STEP above: Play mode's unlink is
                     # scoped to staying in Play mode, and Perform is the
@@ -2823,7 +2631,8 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                     # resync immediately to whatever's actually on the
                     # touchscreen (unchanged the whole time, since Play mode
                     # never touches the screen itself), landing back on
-                    # StepSeq/Zynpad/Mixer/Device as appropriate.
+                    # StepSeq/Zynpad/Mixer, or nowhere in particular, as
+                    # appropriate.
                     self._screen_linked = True
                     self._update_current_handler()
                 elif self._screen_linked:
@@ -2833,9 +2642,9 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                     # from mixer or StepSeq (pattern_editor - you got there
                     # from zynpad in the first place, via BTN_STEP or
                     # Shift+Pad, so this reads as "go back"), go to zynpad;
-                    # from anywhere else (including Device mode's screens),
-                    # go to mixer - so repeated presses settle into
-                    # alternating mixer <-> zynpad.
+                    # from anywhere else (including screens with no
+                    # dedicated mode of their own), go to mixer - so repeated
+                    # presses settle into alternating mixer <-> zynpad.
                     if self._last_screen in ("audio_mixer", "pattern_editor"):
                         self.state_manager.send_cuia("SCREEN_ZYNPAD")
                     else:
@@ -2875,18 +2684,69 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             if note == BTN_RECORD:
                 self.state_manager.send_cuia("TOGGLE_RECORD")
                 return True
+            if note == BTN_PATTERN_SONG:
+                # Labelled "Metronome" in DrivenByMoss's own Fire mapping
+                # (see the protocol doc) - opens the tempo/metronome screen.
+                # An Alt+press direct on/off toggle was tried and reverted:
+                # no CUIA or state_manager method exists for it anywhere in
+                # zynthian (zynthian_gui_tempo's own zctrl - gated behind
+                # `if self.shown` for the actual libseq write - is the only
+                # thing that ever flips it, even the APC key25 mk2 driver's
+                # own Metronome button only ever opens this same screen), so
+                # doing it properly meant reaching past that gate and
+                # hand-syncing the screen's own zctrl/dirty/replot state by
+                # hand - fragile, chasing real bugs each time on hardware.
+                # Not worth it for a toggle the screen itself is one press
+                # away regardless.
+                self.state_manager.send_cuia("TEMPO")
+                return True
             if note in (BTN_PLAY, BTN_STOP):
                 self._btn_timer.is_pressed(note, time.time())
                 return True
+            if note == BTN_SELECT_PRESS and self._is_alt:
+                # BACK - Fire has no dedicated Back button (DeviceHandler's
+                # was a borrowed pad, gone now) - Alt+Select-push stands in
+                # for it instead. Global/unconditional (checked before
+                # handler dispatch below) so it works the same everywhere,
+                # even in StepSeq, which otherwise repurposes a *plain*
+                # Select-push for clearing its own selection.
+                self.state_manager.send_cuia("BACK")
+                return True
 
-            return self._current_handler.note_on(note, vel, self._is_shifted)
+            # Alt+touch on one of the 4 knobs (Volume/Pan/Filter/Resonance) =
+            # a deliberate zynpot "switch" push (short/bold/long), reusing
+            # whatever the current screen's own 4 controllers are. Gated on
+            # Alt because touch is capacitive and fires on any contact (e.g.
+            # just resting a finger while turning the knob) - requiring Alt
+            # held first makes it a deliberate two-hand gesture rather than
+            # incidental. Without Alt, touch falls through to the current
+            # handler's own use of it (usually just clearing the knob-easing
+            # accumulator - see e.g. ZynpotRotate.reset()). Tracked by note
+            # (not re-checking self._is_alt) so release still resolves
+            # correctly even if Alt was let go before the knob was.
+            if note in ZYNPOT_KNOBS and self._is_alt:
+                self._zynpot_touch_active.add(note)
+                self._btn_timer.is_pressed(note, time.time())
+                return True
+
+            # Knob touch/Select-push go through _knobs_handler, not
+            # _current_handler - they can disagree (see _knobs_handler's
+            # comment in __init__) whenever the pad grid is showing a stale
+            # mode. Everything else (pads) always follows _current_handler.
+            if note in ZYNPOT_KNOBS or note == BTN_SELECT_PRESS:
+                if self._knobs_handler.note_on(note, vel, _alt_mode()):
+                    return True
+                return self._default_note_on(note)
+            if self._current_handler.note_on(note, vel, _alt_mode()):
+                return True
+            return self._default_note_on(note)
 
         if evtype == EV_NOTE_OFF:
             note = ev[1] & 0x7F
 
             if note == BTN_SHIFT:
-                self._is_shifted = False
-                self._mixer_handler.on_shift_changed(False)
+                # Sticky - release does nothing, state already flipped on
+                # the press above.
                 return True
             if note == BTN_ALT:
                 self._is_alt = False
@@ -2898,13 +2758,19 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             if note in (BTN_PLAY, BTN_STOP):
                 self._btn_timer.is_released(note)
                 return True
+            if note in self._zynpot_touch_active:
+                self._zynpot_touch_active.discard(note)
+                self._btn_timer.is_released(note)
+                return True
 
-            return self._current_handler.note_off(note, self._is_shifted)
+            return self._current_handler.note_off(note, _alt_mode())
 
         if evtype == EV_CC:
             ccnum = ev[1] & 0x7F
             ccval = ev[2] & 0x7F
-            return self._current_handler.cc_change(ccnum, ccval)
+            if self._knobs_handler.cc_change(ccnum, ccval):
+                return True
+            return self._default_cc_change(ccnum, ccval)
 
         if ev[0] == EV_SYSEX:
             logging.info(f" received SysEx => {ev}")
@@ -2915,9 +2781,9 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
     def update_mixer_strip(self, chan, symbol, value):
         # Guarded: MixerHandler.update_mixer_strip() only repaints (no state
         # to keep fresh for later), so skip it entirely while Mixer isn't the
-        # visible mode - otherwise e.g. turning a knob in Device mode (or any
-        # other zctrl change reaching here) would paint mixer bars on top of
-        # whatever's actually showing on the grid.
+        # visible mode - otherwise e.g. turning a knob on some other screen
+        # (or any other zctrl change reaching here) would paint mixer bars on
+        # top of whatever's actually showing on the grid.
         if self._current_handler is self._mixer_handler:
             self._mixer_handler.update_mixer_strip(chan, symbol, value)
 
@@ -2940,10 +2806,47 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 self.state_manager.send_cuia("ALL_SOUNDS_OFF")
             else:
                 self.state_manager.send_cuia("STOP")
+        else:
+            zynpot = ZYNPOT_KNOBS.get(btn)
+            if zynpot is not None:
+                letter = {CONST.PT_SHORT: 'S', CONST.PT_BOLD: 'B', CONST.PT_LONG: 'L'}[press_type]
+                self.state_manager.send_cuia("V5_ZYNPOT_SWITCH", [zynpot, letter])
+
+    def _default_note_on(self, note):
+        """Fallback for a note the current handler declined (returned
+        falsy) - formerly DeviceHandler/ZynpadHandler's own copy-pasted
+        logic, now the one shared place for it. Touch just resets the
+        shared default zynpot's easing accumulator (Alt+touch, a deliberate
+        push, is already handled earlier in midi_event and never reaches
+        here); Select's own push defaults to zynpot switch 3, same action
+        every handler with nothing more specific for it already sent."""
+        if note in ZYNPOT_KNOBS:
+            self._default_zynpot.reset(note)
+            return True
+        if note == BTN_SELECT_PRESS:
+            self.state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
+            return True
+        return False
+
+    def _default_cc_change(self, ccnum, ccval):
+        """Fallback for a CC the current handler declined (returned falsy) -
+        same story as _default_note_on above. Select defaults to list
+        navigation (up/down, or left/right while Alt is held - see
+        _select_knob_arrow), the other 4 knobs to zynpot rotate."""
+        if ccnum == KNOB_SELECT:
+            _select_knob_arrow(self.state_manager, ccval, self._is_alt)
+            return True
+        return self._default_zynpot.cc_change(ccnum, ccval)
 
     def _set_current_handler(self, handler):
-        """Switch to the given handler (no-op if it's already current),
-        refreshing its pad state and the mode LEDs."""
+        """Switch to the given handler (no-op on the pad-grid side if it's
+        already current), refreshing its pad state and the mode LEDs.
+        Always resyncs _knobs_handler to match, even on the pad no-op path -
+        needed for e.g. re-linking back onto the screen _current_handler was
+        already (silently) showing, where _knobs_handler had since drifted
+        to self._null_handler (see _update_current_handler) and needs
+        pulling back in line even though the pads never actually changed."""
+        self._knobs_handler = handler
         if self._current_handler is handler:
             return
         old_handler = self._current_handler
@@ -2970,11 +2873,22 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         self._refresh_oled()
 
     def _update_current_handler(self):
-        """While screen-linked, re-derive _current_handler from
-        _last_screen. While unlinked, do nothing - _current_handler stays
-        exactly as-is regardless of screen changes, until re-linked (which
-        immediately re-syncs to whatever screen is current at that point).
-        Called on screen changes and on the Alt+Browser link toggle."""
+        """While screen-linked, re-derive _current_handler (pad grid) and
+        _knobs_handler from _last_screen. While unlinked, do nothing - both
+        stay exactly as-is regardless of screen changes, until re-linked
+        (which immediately re-syncs to whatever screen is current at that
+        point) - a deliberate pin (see Alt+Browser) applies to knobs too, not
+        just pads. Called on screen changes and on the Alt+Browser link
+        toggle.
+
+        A screen with no dedicated mode of its own (Admin, Preset, Control,
+        Snapshot, main menu, etc., now that DeviceHandler is gone) matches
+        none of the cases below: _current_handler - and the pad grid - just
+        stays whatever it already was, rather than switching to anything or
+        going blank, but _knobs_handler goes to self._null_handler so the 4
+        knobs/Select/Select-push fall to the generic default instead of
+        running that stale mode's own logic invisibly (see its own comment
+        in __init__)."""
         if not self._screen_linked:
             return
         if self._last_screen == "audio_mixer":
@@ -2984,18 +2898,8 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         elif self._last_screen == "pattern_editor":
             self._set_current_handler(self._stepseq_handler)
         else:
-            self._set_current_handler(self._device_handler)
+            self._knobs_handler = self._null_handler
 
     def _on_gui_show_screen(self, screen, **kwargs):
         self._last_screen = screen
-        was_device = self._current_handler is self._device_handler
-        # Keep DeviceHandler's screen-access pad state in sync even while it
-        # isn't the active handler, so it's already correct if/when we switch
-        # (or force) into Device mode later.
-        self._device_handler.on_screen_change(screen)
         self._update_current_handler()
-        # _update_current_handler() only refreshes on a handler change; if we
-        # were already in Device mode and just the screen changed, still need
-        # to repaint the screen-access pads to match.
-        if was_device and self._current_handler is self._device_handler:
-            self._device_handler.refresh()
