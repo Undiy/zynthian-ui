@@ -61,6 +61,7 @@ import multiprocessing as mp
 from PIL import Image, ImageDraw, ImageFont
 
 from zynlibs.zynseq import zynseq
+from zynlibs.zynaudioplayer import zynaudioplayer
 from zyngine.ctrldev.zynthian_ctrldev_base import zynthian_ctrldev_base, zynthian_ctrldev_zynmixer, zynthian_ctrldev_zynpad
 from zyngine.ctrldev.zynthian_ctrldev_base_extended import ButtonTimer, CONST, IntervalTimer
 from zyngine.ctrldev.zynthian_ctrldev_base_ui import ModeHandlerBase
@@ -171,6 +172,14 @@ LED_SOLO_4 = 0x2B
 LED_BROWSER = BTN_BROWSER
 LED_PERFORM = BTN_PERFORM
 LED_SHIFT = BTN_SHIFT
+LED_STEP = BTN_STEP
+LED_NOTE = BTN_NOTE
+LED_DRUM = BTN_DRUM
+LED_ALT = BTN_ALT
+LED_PLAY = BTN_PLAY
+LED_STOP = BTN_STOP
+LED_RECORD = BTN_RECORD
+LED_METRONOME = BTN_PATTERN_SONG  # labelled "Metronome" in DrivenByMoss, same yellow-green family as Play
 
 # Button LED color values, confirmed from the SEGGER blog's decoding series
 # (see "Color palette" in zynthian_ctrldev_akai_fire_protocol.md). Each button
@@ -186,9 +195,29 @@ LED_RED_HIGH = 2
 LED_GREEN_DULL = 1
 LED_GREEN_HIGH = 2
 
-# Yellow-red: Step, Note, Drum, Perform, Shift, Record
-LED_YR_HIGH_YELLOW = 3
-LED_YR_HIGH_RED = 4
+# Yellow-red: Step, Note, Drum, Perform, Shift, Record - confirmed against
+# DrivenByMoss's own FireColorManager.getColor() (SEQUENCER/NOTE/DRUM/
+# SESSION/SHIFT/RECORD case): 1/3 are red (dull/high), 2/4 are
+# orange/"yellow" (dull/high) - opposite pairing from an earlier, wrong
+# transcription of the SEGGER blog's own table (which had 1=dull yellow,
+# swapped with what's actually dull red - found on real hardware: idle
+# buttons lit dull red instead of the intended dull yellow).
+LED_YR_DULL_RED = 1
+LED_YR_DULL_YELLOW = 2
+LED_YR_HIGH_RED = 3
+LED_YR_HIGH_YELLOW = 4
+
+# Yellow-only: Alt, Stop
+LED_Y_DULL = 1
+LED_Y_HIGH = 2
+
+# Yellow-green: Pattern/Song ("Metronome" in DrivenByMoss), Play - confirmed
+# against FireColorManager.getColor()'s METRONOME/PLAY case, same 1/3=green,
+# 2/4=orange("yellow") pairing pattern as yellow-red above.
+LED_YG_DULL_GREEN = 1
+LED_YG_DULL_YELLOW = 2
+LED_YG_HIGH_GREEN = 3
+LED_YG_HIGH_YELLOW = 4
 
 # Bank/Mode's own LED (0x1B) isn't in the blog's table - still unverified,
 # kept as a generic on/off placeholder (see protocol doc).
@@ -270,7 +299,8 @@ class FeedbackLEDs:
         self.control_leds_off()
 
     def control_leds_off(self):
-        for led in (LED_BANK, LED_SOLO_1, LED_SOLO_2, LED_SOLO_3, LED_SOLO_4, LED_BROWSER, LED_PERFORM, LED_SHIFT):
+        for led in (LED_BANK, LED_SOLO_1, LED_SOLO_2, LED_SOLO_3, LED_SOLO_4, LED_BROWSER, LED_PERFORM, LED_SHIFT,
+                    LED_STEP, LED_NOTE, LED_DRUM, LED_ALT, LED_PLAY, LED_STOP, LED_RECORD, LED_METRONOME):
             self.led_off(led)
 
     def led_off(self, led):
@@ -2299,6 +2329,9 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         self._null_handler = ModeHandlerBase(state_manager)
         self._knobs_handler = self._mixer_handler
         self._default_zynpot = ZynpotRotate(state_manager)
+        # (bank, seq) pairs currently playing, anywhere - see
+        # _pattern_is_playing()/update_seq_state().
+        self._playing_sequences = set()
         # OLED mode-name label per handler - see _refresh_oled().
         self._mode_labels = {
             self._mixer_handler: "Mixer",
@@ -2331,6 +2364,20 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
 
         self._signals = [
             (zynsigman.S_GUI, zynsigman.SS_GUI_SHOW_SCREEN, self._on_gui_show_screen),
+            # Transport LEDs (Play/Record - see _update_mode_leds) need to
+            # react live to playback/recording starting or stopping, not
+            # just to mode/screen changes like everything else here - same
+            # signals zynthian_ctrldev_akai_apc_key25_mk2.py's own DeviceHandler
+            # uses for the same purpose. state_manager re-exposes the audio
+            # ones under its own name (same subsignal ids), so no extra
+            # imports (zynthian_engine_audioplayer/zynthian_audio_recorder)
+            # are needed. Actual state is read live off state_manager at
+            # refresh time (same "don't cache, just re-check" approach as
+            # _alt_mode()) rather than tracked from the signal payload.
+            (zynsigman.S_AUDIO_PLAYER, state_manager.SS_AUDIO_PLAYER_STATE, self._on_transport_state_changed),
+            (zynsigman.S_AUDIO_RECORDER, state_manager.SS_AUDIO_RECORDER_STATE, self._on_transport_state_changed),
+            (zynsigman.S_STATE_MAN, state_manager.SS_MIDI_PLAYER_STATE, self._on_transport_state_changed),
+            (zynsigman.S_STATE_MAN, state_manager.SS_MIDI_RECORDER_STATE, self._on_transport_state_changed),
         ]
 
         # NOTE: init() (called by the manager right after this ctor) will call
@@ -2356,6 +2403,12 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         super().init()
         for signal, subsignal, callback in self._signals:
             zynsigman.register(signal, subsignal, callback)
+
+        # Alt's own momentary lighting (see midi_event's BTN_ALT handling)
+        # isn't part of _update_mode_leds() - already ran once via
+        # super().init() -> refresh() above - so it needs its own initial
+        # dull-default here, matching the rest of its button cluster.
+        self._leds.led_on(LED_ALT, LED_Y_DULL)
 
         # ACTI mode ("active chain input"): any note arriving on this
         # device's zmip routes to whichever chain is currently active,
@@ -2478,9 +2531,25 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         self._update_mode_leds()
 
     def _update_mode_leds(self):
+        # This whole bottom-left cluster (Step/Note/Drum/Perform/Shift, all
+        # yellow-red) idles at dull yellow rather than fully off - reads as
+        # "alive"/available, brightening or changing color for whatever's
+        # actually active - same idea BTN_ALT's own momentary lighting
+        # follows (see its note_on/note_off), just state-driven here instead
+        # of held-driven. Bank/Mode and Browser aren't part of this cluster
+        # (different color families / already-established behavior) and are
+        # untouched.
+
         # Shift mirrors zynthian's own persistent alt_mode toggle - see
-        # _alt_mode()'s docstring - lit whenever it's on, off otherwise.
-        self._leds.led_on(LED_SHIFT, LED_YR_HIGH_YELLOW) if _alt_mode() else self._leds.led_off(LED_SHIFT)
+        # _alt_mode()'s docstring.
+        self._leds.led_on(LED_SHIFT, LED_YR_HIGH_RED if _alt_mode() else LED_YR_DULL_YELLOW)
+
+        # Bank/Mode is one of the alternate ways to flip the very same
+        # alt_mode toggle (see _alt_mode()'s docstring) - mirrors it too,
+        # same as Shift, though its own LED color family is unconfirmed (see
+        # protocol doc) so this stays a plain on/off rather than assuming it
+        # also supports yellow-red's dull/high split.
+        self._leds.led_on(LED_BANK, LED_ON) if _alt_mode() else self._leds.led_off(LED_BANK)
 
         # Browser (red-only): repurposed as a screen-link indicator - lit
         # whenever unlinked, as a reminder the Fire's mode won't follow
@@ -2488,7 +2557,7 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         self._leds.led_on(LED_BROWSER, LED_RED_HIGH) if not self._screen_linked \
             else self._leds.led_off(LED_BROWSER)
 
-        # Perform (yellow-red): red in Mixer mode, yellow in Zynpad mode, off
+        # Perform: red in Mixer mode, yellow in Zynpad mode, dull yellow
         # otherwise (Perform only toggles between the two "performance"
         # screens - see BTN_PERFORM - nothing else is part of that toggle).
         if self._current_handler is self._mixer_handler:
@@ -2496,7 +2565,113 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         elif self._current_handler is self._zynpad_handler:
             self._leds.led_on(LED_PERFORM, LED_YR_HIGH_YELLOW)
         else:
-            self._leds.led_off(LED_PERFORM)
+            self._leds.led_on(LED_PERFORM, LED_YR_DULL_YELLOW)
+
+        # Step: yellow while StepSeq is the active mode, dull yellow
+        # otherwise - same "which mode is active" convention as Perform.
+        self._leds.led_on(LED_STEP, LED_YR_HIGH_YELLOW if self._current_handler is self._stepseq_handler
+                           else LED_YR_DULL_YELLOW)
+
+        # Note: yellow while Play is the active mode; red while sitting on
+        # the Snapshot screen (Alt+Note's own target - see BTN_NOTE) as a
+        # "you're here" hint, same idea as Perform's own red/yellow split
+        # for Mixer/Zynpad; dull yellow otherwise. Play-active takes
+        # priority in the (unlikely, since Play doesn't touch the
+        # touchscreen itself) case both happen to be true at once.
+        if self._current_handler is self._play_handler:
+            self._leds.led_on(LED_NOTE, LED_YR_HIGH_YELLOW)
+        elif self._last_screen == "snapshot":
+            self._leds.led_on(LED_NOTE, LED_YR_HIGH_RED)
+        else:
+            self._leds.led_on(LED_NOTE, LED_YR_DULL_YELLOW)
+
+        # Drum: reserved for a future mode - dull yellow, nothing to react
+        # to yet (same "alive but idle" cluster default as everything else
+        # here).
+        self._leds.led_on(LED_DRUM, LED_YR_DULL_YELLOW)
+
+        # Transport (Play/Stop/Record) - loosely based on zynthian_wsleds_v5.py
+        # (Record lights while audio_recorder.rec_proc, Play while
+        # status_audio_player) and zynthian_ctrldev_akai_apc_key25_mk2.py's
+        # DeviceHandler (same idea, signal-driven), but both of those only
+        # ever show one generic "lit" state - extended here to distinguish
+        # audio vs MIDI by color, since TOGGLE_RECORD/TOGGLE_PLAY/STOP
+        # already target one or the other depending on _alt_mode() (see
+        # zynthian_gui.cuia_toggle_record/_play/_stop). Idle itself reflects
+        # which one is *currently targeted* rather than a flat neutral color,
+        # so toggling alt_mode (Shift/Bank/Alt+touch) visibly changes these
+        # two even with nothing actually playing/recording yet - confirmed
+        # missing on real hardware (pressing Shift produced no visible
+        # change, since idle color didn't depend on alt_mode at all).
+        is_midi = _alt_mode()
+        # state_manager.status_audio_player is a cached copy, updated by its
+        # own cb_status_audio_player() - a SEPARATE subscriber to the same
+        # SS_AUDIO_PLAYER_STATE signal we are, racing us for who reads/
+        # writes first depending on registration order. Confirmed backwards
+        # on real hardware (lit only once playback had already stopped, not
+        # while actually playing) - read the live engine state directly
+        # instead, sidestepping the race entirely. status_midi_player/
+        # status_midi_recorder/audio_recorder.rec_proc don't have this
+        # problem (each is written directly, in the same method, before its
+        # own signal is sent - no competing cached copy involved).
+        audio_player = self.state_manager.audio_player
+        is_audio_playing = audio_player is not None and zynaudioplayer.get_playback_state(audio_player.handle)
+
+        # Record only has red+yellow in its own family (no green - it's
+        # yellow-red, not yellow-green) - audio uses red (also just the
+        # conventional "recording" color on real hardware), MIDI uses
+        # yellow, both dimmed to "dull" for idle/targeted-but-not-recording.
+        if self.state_manager.audio_recorder.rec_proc:
+            self._leds.led_on(LED_RECORD, LED_YR_HIGH_RED)
+        elif self.state_manager.status_midi_recorder:
+            self._leds.led_on(LED_RECORD, LED_YR_HIGH_YELLOW)
+        else:
+            self._leds.led_on(LED_RECORD, LED_YR_DULL_YELLOW if is_midi else LED_YR_DULL_RED)
+
+        # Play's own family (yellow-green) has a real green for audio.
+        # "MIDI playing" also covers the pattern currently open in
+        # StepSeq/the pattern editor - BTN_PLAY/BTN_STOP there drive
+        # zynseq's own per-sequence transport directly
+        # (zynthian_gui_patterneditor.toggle_playback() ->
+        # libseq.setPlayState()), which never touches status_midi_player or
+        # emits either transport signal at all - found on real hardware
+        # (pattern playback worked, but this LED didn't react to it) -
+        # _pattern_is_playing() below covers that gap.
+        if is_audio_playing:
+            self._leds.led_on(LED_PLAY, LED_YG_HIGH_GREEN)
+        elif self.state_manager.status_midi_player or self._pattern_is_playing():
+            self._leds.led_on(LED_PLAY, LED_YG_HIGH_YELLOW)
+        else:
+            self._leds.led_on(LED_PLAY, LED_YG_DULL_YELLOW if is_midi else LED_YG_DULL_GREEN)
+
+        # Stop: DrivenByMoss's own FireColorManager only ever sends 0/1/2 to
+        # this button (yellow-only family, confirmed) - values 3/4
+        # (LED_YR_*_RED, i.e. reusing yellow-red's own red tier) are
+        # unverified for it specifically, requested/tried anyway since
+        # DrivenByMoss simply never exercising a value doesn't prove the
+        # hardware can't do it. Real hardware (V5/APC) never reacts here at
+        # all; this shows "is there anything to stop" instead, same idea as
+        # the yellow version this replaces.
+        anything_playing = is_audio_playing or self.state_manager.status_midi_player or self._pattern_is_playing()
+        self._leds.led_on(LED_STOP, LED_YR_HIGH_RED if anything_playing else LED_YR_DULL_RED)
+
+        # Metronome (BTN_PATTERN_SONG) - same yellow-green family as Play,
+        # lit while the Tempo screen it opens (see midi_event's
+        # BTN_PATTERN_SONG handling) is actually showing.
+        self._leds.led_on(LED_METRONOME, LED_YG_HIGH_YELLOW if self._last_screen == "tempo" else LED_YG_DULL_YELLOW)
+
+    def _pattern_is_playing(self):
+        """Whether any sequence, in any bank, is currently playing - see the
+        Play LED comment above for why this needs its own check, separate
+        from state_manager's status_audio_player/status_midi_player.
+        self._playing_sequences is kept up to date incrementally by
+        update_seq_state() - not scanned here, and deliberately not scoped
+        to only zynpad's own currently-selected pad (a pattern started
+        elsewhere and left running should still count)."""
+        return bool(self._playing_sequences)
+
+    def _on_transport_state_changed(self, **kwargs):
+        self._update_mode_leds()
 
     def light_off(self):
         self._leds.all_off()
@@ -2568,6 +2743,11 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 return True
             if note == BTN_ALT:
                 self._is_alt = True
+                # Momentary - lit while held (yellow-only family: dull by
+                # default matching the rest of this button cluster, high
+                # while pressed), unlike Shift/Bank/Perform/Step/Note above
+                # which are state-driven via _update_mode_leds() instead.
+                self._leds.led_on(LED_ALT, LED_Y_HIGH)
                 # Alt+Browser (screen-link toggle), Alt+Note (Snapshot) and
                 # Alt+Perform (ZS3) work from any mode, so _is_alt itself is
                 # tracked unconditionally above - but only forward into MixerHandler
@@ -2597,10 +2777,23 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             if note == BTN_NOTE:
                 if self._is_alt:
                     # Snapshot access - screen-driven like BTN_STEP just
-                    # above, so no forcing/unlinking: screen-follow
+                    # above, so normally no forcing/unlinking: screen-follow
                     # (_update_current_handler) leaves _current_handler as-is,
                     # since "snapshot" has no dedicated mode of its own - the
                     # pad grid just keeps showing whatever it already did.
+                    # Exception: if Play is currently active, leave it first -
+                    # relinking alone isn't enough, since neither "snapshot"
+                    # nor "zs3" (Alt+Perform's own target) are screens
+                    # _update_current_handler() can match, so _current_handler
+                    # would stay stuck on Play even after relinking - the very
+                    # next Perform press would just re-enter its own "leaving
+                    # Play" branch forever instead of ever reaching actual
+                    # Mixer/Zynpad navigation (found on real hardware).
+                    # Mixer is a reasonable, predictable place to land, same
+                    # default this driver already picks at construction.
+                    if self._current_handler is self._play_handler:
+                        self._screen_linked = True
+                        self._set_current_handler(self._mixer_handler)
                     self.state_manager.send_cuia("SCREEN_SNAPSHOT")
                     return True
                 if self._current_handler is self._play_handler:
@@ -2622,7 +2815,12 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                     # akai_fire_stepseq_plan.md discussion for how this
                     # pairing settled). This used to jump straight to Device
                     # mode instead; screen-driven now, like everything else
-                    # here - no forcing/unlinking needed.
+                    # here. Same Play-mode exception as Alt+Note above - Alt
+                    # here takes priority over the "leaving Play" elif right
+                    # below, so it needs its own relink+handoff.
+                    if self._current_handler is self._play_handler:
+                        self._screen_linked = True
+                        self._set_current_handler(self._mixer_handler)
                     self.state_manager.send_cuia("SCREEN_ZS3")
                 elif self._current_handler is self._play_handler:
                     # Same reasoning as BTN_STEP above: Play mode's unlink is
@@ -2635,6 +2833,17 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                     # appropriate.
                     self._screen_linked = True
                     self._update_current_handler()
+                    if self._current_handler is self._play_handler:
+                        # _last_screen didn't match any of the 3 real modes
+                        # (e.g. Play was entered from Admin, or some other
+                        # screen with no dedicated mode of its own) -
+                        # _update_current_handler() alone can never move
+                        # pad-grid ownership off Play in that case (same
+                        # root cause as the Alt+Note/Alt+Perform fix above),
+                        # so fall back to Mixer explicitly rather than
+                        # leaving Perform stuck re-entering this same branch
+                        # forever on every subsequent press.
+                        self._set_current_handler(self._mixer_handler)
                 elif self._screen_linked:
                     # Screen-driven: change the actual screen; screen-follow
                     # (_update_current_handler) then updates the mode to
@@ -2750,6 +2959,7 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 return True
             if note == BTN_ALT:
                 self._is_alt = False
+                self._leds.led_on(LED_ALT, LED_Y_DULL)
                 if self._current_handler is self._mixer_handler:
                     self._mixer_handler.set_alt(False)
                 elif self._current_handler is self._stepseq_handler:
@@ -2794,6 +3004,21 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         # Same reasoning as update_mixer_strip above.
         if self._current_handler is self._zynpad_handler:
             self._zynpad_handler.update_seq_state(bank, seq, state, mode, group)
+        # Unconditional, unlike the zynpad forwarding above - the Play/Stop
+        # LEDs' own "is any pattern playing" check (see _update_mode_leds)
+        # needs to track every sequence, everywhere, regardless of which
+        # mode is current or which one is currently selected. Maintained
+        # incrementally here rather than scanning all sequences on every LED
+        # refresh, since this signal already fires globally for every
+        # sequence's play-state change (same one Zynpad's own reactive pad
+        # colors are built on) - found on real hardware that checking only
+        # zynpad's own selected_pad missed every other pattern still
+        # playing in the background.
+        if state in (zynseq.SEQ_PLAYING, zynseq.SEQ_STARTING, zynseq.SEQ_RESTARTING):
+            self._playing_sequences.add((bank, seq))
+        else:
+            self._playing_sequences.discard((bank, seq))
+        self._update_mode_leds()
 
     def _handle_timed_button(self, btn, press_type):
         if btn == BTN_PLAY:
@@ -2903,3 +3128,9 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
     def _on_gui_show_screen(self, screen, **kwargs):
         self._last_screen = screen
         self._update_current_handler()
+        # _update_current_handler() only refreshes LEDs (via
+        # _set_current_handler) on an actual pad-mode change - Note's own
+        # "on the Snapshot screen" hint (see _update_mode_leds) needs to
+        # react to every screen change regardless, since landing on
+        # Snapshot alone never changes which mode the pad grid shows.
+        self._update_mode_leds()
