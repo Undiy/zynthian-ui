@@ -55,6 +55,7 @@ import os
 import time
 import json
 import queue
+import colorsys
 import logging
 import multiprocessing as mp
 
@@ -163,8 +164,19 @@ def _resolve_play_midi_chan():
 
 # Output-only LED addresses (channel 0, CC message; value = color, see below)
 # For "plain" buttons, LED feedback is CC == the button's own note number.
-# Bank/Mode and the Solo strip are exceptions, with their own dedicated addresses.
+# Bank/Mode is an exception, with its own dedicated address. Solo 1-4 are a
+# bigger exception: each has TWO independent lights, both hardware-confirmed
+# (live amidi testing, see zynthian_ctrldev_akai_fire_stepseq_plan.md/
+# protocol doc) - the button cap itself, which DOES follow the general
+# CC-on-its-own-note rule (LED_SOLO_1_BTN etc., green-only), plus a second,
+# separate "Solo strip" light right next to it at its own dedicated address
+# (LED_SOLO_1 etc. below, red-green) - MixerHandler._paint_solo_led drives
+# both together: the cap for selection state, the strip for mute/solo.
 LED_BANK = 0x1B
+LED_SOLO_1_BTN = BTN_SOLO_1
+LED_SOLO_2_BTN = BTN_SOLO_2
+LED_SOLO_3_BTN = BTN_SOLO_3
+LED_SOLO_4_BTN = BTN_SOLO_4
 LED_SOLO_1 = 0x28
 LED_SOLO_2 = 0x29
 LED_SOLO_3 = 0x2A
@@ -180,6 +192,10 @@ LED_PLAY = BTN_PLAY
 LED_STOP = BTN_STOP
 LED_RECORD = BTN_RECORD
 LED_METRONOME = BTN_PATTERN_SONG  # labelled "Metronome" in DrivenByMoss, same yellow-green family as Play
+LED_PAT_UP = BTN_PAT_UP
+LED_PAT_DOWN = BTN_PAT_DOWN
+LED_GRID_LEFT = BTN_GRID_LEFT
+LED_GRID_RIGHT = BTN_GRID_RIGHT
 
 # Button LED color values, confirmed from the SEGGER blog's decoding series
 # (see "Color palette" in zynthian_ctrldev_akai_fire_protocol.md). Each button
@@ -191,7 +207,28 @@ LED_OFF = 0
 LED_RED_DULL = 1
 LED_RED_HIGH = 2
 
-# Green-only: the Solo-strip addresses (LED_SOLO_1-4)
+# Red-green: the Solo-strip addresses (LED_SOLO_1-4) - previously treated
+# as green-only (values 1/2 only), copied from DrivenByMoss's own
+# FireColorManager.getColor() SCENE1-4 case, which really does only ever
+# return DARK_GREEN/GREEN for this button - but that's DrivenByMoss's own
+# choice of what to send, not the hardware's actual ceiling (same gap as
+# Stop, see LED_Y_DULL/HIGH below). Hardware-confirmed via live amidi
+# testing from a dev host (side-by-side value comparisons, see
+# zynthian_ctrldev_akai_fire_stepseq_plan.md): all 4 non-off values are
+# real and distinct - 1=dull red, 2=dull green, 3=high red, 4=high green -
+# the same odd=primary/even=secondary, (1,2)=dull/(3,4)=high shape every
+# other 4-value family here has.
+LED_RG_DULL_RED = 1
+LED_RG_DULL_GREEN = 2
+LED_RG_HIGH_RED = 3
+LED_RG_HIGH_GREEN = 4
+
+# Green-only: the Solo BUTTON CAPS themselves (LED_SOLO_1_BTN-4_BTN) - a
+# second, independent light from the Solo-strip's own red-green family
+# right above, confirmed on the same live hardware test. Only 2 real
+# states (0=off, 1=dull, 2/3/4 all render as the same bright green - no
+# red at all here, unlike the strip), matching Yellow-only's own "only 2
+# real states" shape.
 LED_GREEN_DULL = 1
 LED_GREEN_HIGH = 2
 
@@ -253,11 +290,14 @@ def _alt_mode():
     this and it stays flipped, like DrivenByMoss's Fire implementation, as
     opposed to a momentary hold) and Shift/Bank can never disagree about the
     current state, since they're both just alternate ways to read/flip this
-    one value. Every "shifted"
-    modifier check across all handlers (Mixer's Shift+Solo-N mute, Zynpad's
-    Shift+Pad, StepSeq/PlayHandler's Shift+Grid/Pattern combos, etc.) is
-    forwarded this same live value on every button press - see midi_event's
-    two _current_handler.note_on/note_off calls - not a locally-cached one.
+    one value. Every "shifted" modifier check across all handlers that still
+    have one (Mixer's Shift+Solo-N mute, StepSeq's Shift+Grid/Pattern
+    combos) is forwarded this same live value on every button press - see
+    midi_event's two _current_handler.note_on/note_off calls - not a
+    locally-cached one. Zynpad's own former Shift+Pad moved to Alt+Pad once
+    Shift went sticky (a momentary hold reads more naturally for "hold +
+    tap" than a persistent toggle does - see ZynpadHandler.note_on); Play
+    mode never had a Shift-modified action to begin with.
     NOT the same thing as momentarily holding Fire's own physical Alt button
     (BTN_ALT) - that's a separate, unrelated modifier (see e.g. Alt+Solo-N in
     MixerHandler). zyngui can still be None here: driver loading is
@@ -299,8 +339,11 @@ class FeedbackLEDs:
         self.control_leds_off()
 
     def control_leds_off(self):
-        for led in (LED_BANK, LED_SOLO_1, LED_SOLO_2, LED_SOLO_3, LED_SOLO_4, LED_BROWSER, LED_PERFORM, LED_SHIFT,
-                    LED_STEP, LED_NOTE, LED_DRUM, LED_ALT, LED_PLAY, LED_STOP, LED_RECORD, LED_METRONOME):
+        for led in (LED_BANK, LED_SOLO_1, LED_SOLO_2, LED_SOLO_3, LED_SOLO_4,
+                    LED_SOLO_1_BTN, LED_SOLO_2_BTN, LED_SOLO_3_BTN, LED_SOLO_4_BTN,
+                    LED_BROWSER, LED_PERFORM, LED_SHIFT,
+                    LED_STEP, LED_NOTE, LED_DRUM, LED_ALT, LED_PLAY, LED_STOP, LED_RECORD, LED_METRONOME,
+                    LED_PAT_UP, LED_PAT_DOWN, LED_GRID_LEFT, LED_GRID_RIGHT):
             self.led_off(led)
 
     def led_off(self, led):
@@ -627,7 +670,13 @@ class MixerHandler(ModeHandlerBase):
     # fresh from the current value, requiring an exact match) means repeated
     # taps on one physical pad keep working even as the fill visually crosses
     # into a neighboring pad's range.
-    FINE_STEPS = 4
+    # 5, not the more obvious 4, so the default chain volume (0.8 linear,
+    # -1.94dB) lands on an exact fine step (16*5*0.8 = 64.0) instead of
+    # rounding to the nearest one (16*4*0.8 = 51.2 -> 51, -1.97dB - the
+    # closest reachable value before this change). Any multiple of 5 works
+    # for that same reason (0.8 * 5k is always an integer); 5 is the
+    # smallest one, barely finer than the 4 this replaces.
+    FINE_STEPS = 5
 
     def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs):
         super().__init__(state_manager)
@@ -674,19 +723,36 @@ class MixerHandler(ModeHandlerBase):
         return self._chain_manager.get_chain(ids[index])
 
     def _paint_solo_led(self, pos):
-        # Solo strip is green-only (0=off, 1=dull, 2=high - see protocol doc),
-        # only 2 non-off levels available, so solo and mute share the dull
-        # level (indistinguishable from each other, but distinct from selected).
+        """Both of Solo N's independent lights (see the "Solo 1-4 have two
+        lights" finding in zynthian_ctrldev_akai_fire_stepseq_plan.md):
+
+        - Button cap (LED_SOLO_N_BTN, green-only - own note number as CC):
+          selection state. High green = this slot's chain is the active
+          one, dull green = a chain is there but not selected, off = no
+          chain in this slot.
+        - Strip (LED_SOLO_N, red-green, adjacent to the cap): mute/solo
+          state, independent of selection. High red = muted, high green =
+          solo'd, off = neither. A chain can technically have both its own
+          mute and solo flags set at once (they're independent zynmixer
+          toggles) - solo wins the LED in that case, since a soloed chain
+          is never actually silenced by its own mute flag regardless.
+        """
         chain = self._chain_at(pos)
-        led = LED_SOLO_1 + pos
+        btn_led = LED_SOLO_1_BTN + pos
+        strip_led = LED_SOLO_1 + pos
         if chain is None:
-            self._leds.led_off(led)
-        elif chain.chain_id == self._active_chain:
-            self._leds.led_on(led, LED_GREEN_HIGH)
-        elif self._zynmixer.get_solo(chain.mixer_chan) or self._zynmixer.get_mute(chain.mixer_chan):
-            self._leds.led_on(led, LED_GREEN_DULL)
+            self._leds.led_off(btn_led)
+            self._leds.led_off(strip_led)
+            return
+
+        self._leds.led_on(btn_led, LED_GREEN_HIGH if chain.chain_id == self._active_chain else LED_GREEN_DULL)
+
+        if self._zynmixer.get_solo(chain.mixer_chan):
+            self._leds.led_on(strip_led, LED_RG_HIGH_GREEN)
+        elif self._zynmixer.get_mute(chain.mixer_chan):
+            self._leds.led_on(strip_led, LED_RG_HIGH_RED)
         else:
-            self._leds.led_off(led)
+            self._leds.led_off(strip_led)
 
     def _paint_row(self, pos):
         chain = self._chain_at(pos)
@@ -851,6 +917,10 @@ class MixerHandler(ModeHandlerBase):
             return True
 
         if note == BTN_GRID_LEFT:
+            # Momentary flash to high-red on press, back to dull red on
+            # release (note_off below) - see _update_mode_leds' own comment
+            # for why these are just "bound"/"not bound", not boundary-aware.
+            self._leds.led_on(LED_GRID_LEFT, LED_RED_HIGH)
             # Master page (see _chain_at()) sits one step past the last
             # regular page - Grid Left/Right walk in and out of it too.
             if self._on_master_page:
@@ -861,6 +931,7 @@ class MixerHandler(ModeHandlerBase):
             return True
 
         if note == BTN_GRID_RIGHT:
+            self._leds.led_on(LED_GRID_RIGHT, LED_RED_HIGH)
             if self._on_master_page:
                 pass
             elif self._chains_bank >= self._max_bank():
@@ -877,6 +948,10 @@ class MixerHandler(ModeHandlerBase):
     def note_off(self, note, shifted_override=None):
         if PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64:
             self._off_bar_pad(note)
+        elif note == BTN_GRID_LEFT:
+            self._leds.led_on(LED_GRID_LEFT, LED_RED_DULL)
+        elif note == BTN_GRID_RIGHT:
+            self._leds.led_on(LED_GRID_RIGHT, LED_RED_DULL)
 
     def cc_change(self, ccnum, ccval):
         # Select's own encoder isn't noisy like the other 4 - use it raw.
@@ -976,15 +1051,46 @@ def _normalize_rgb127(rgb):
     return tuple(round(c * 127 / peak) for c in rgb)
 
 
+# Tuned on real hardware via a standalone pad-color tester (talks straight
+# to the Fire over ALSA rawmidi, outside zynthian-ui - see the "Zynpad
+# group-color saturation" entry in zynthian_ctrldev_akai_fire_stepseq_plan.md
+# for how/why). Module-level (not class attributes) so ZynpadHandler's own
+# class-body comprehensions below can actually see them - see that class's
+# comment.
+_GROUP_SATURATION_BOOST = 1.8
+_GROUP_DIM_FACTOR = 0.08
+
+
+def _boost_saturation_rgb127(rgb, factor):
+    """zynthian_gui_config.PAD_COLOUR_GROUP is tuned for the touchscreen (kept
+    muted so text overlays stay readable) - straight through to the pad LEDs
+    that reads as washed-out/pale at full brightness. Scaling RGB by a
+    constant (as dimming does) leaves HSV saturation untouched, it only
+    crushes value, so a plain dim leans gray rather than a dark version of
+    the hue. Boosting saturation in HSV before use fixes both: confirmed
+    on real hardware against zynthian_ctrldev_akai_fire's own pad-test
+    tester (see zynthian_ctrldev_akai_fire_stepseq_plan.md) - factor=1.8
+    was the user's pick."""
+    r, g, b = (c / 127 for c in rgb)
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    s = min(1.0, s * factor)
+    r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
+    return tuple(round(c * 127) for c in (r2, g2, b2))
+
+
 # --------------------------------------------------------------------------
 # Handle Zynpad (sequence/clip launcher, active on the zynpad screen)
 # --------------------------------------------------------------------------
 #
-# Fire has 4 physical pad rows but a zynseq bank can be up to 8x8 - rather than
-# add row-paging, this uses the grid's extra width instead: each pair of
-# adjacent physical columns (0-1, 2-3, ... 14-15) is one logical column, the
-# first of the pair showing logical rows 0-3 and the second rows 4-7 - closer
-# to the original 8x8 layout than two separate 8-wide halves would be. See
+# Fire has 4 physical pad rows but a zynseq bank is always square and can be
+# up to 8x8 (col_in_bank, see zynseq.py - there's no separate row count).
+# When it fits within 4 rows (col_in_bank <= 4 - the common case), pads map
+# 1:1 - physical column = logical column, physical row = logical row, no
+# gaps. When it doesn't (col_in_bank 5-8), rather than add row-paging, this
+# uses the grid's extra width instead: each pair of adjacent physical
+# columns (0-1, 2-3, ... 14-15) becomes one logical column, the first of the
+# pair showing logical rows 0-3 and the second rows 4-7 - closer to the
+# original 8x8 layout than two separate 8-wide halves would be. See
 # _logical_xy()/_physical_xy() for the mapping.
 #
 # Fire's pads also have no native blink (confirmed in the protocol doc, and
@@ -998,40 +1104,105 @@ class ZynpadHandler(ModeHandlerBase):
     PHYS_COLS = 16
     PHYS_ROWS = 4
 
-    # Group hues mirror zyngui.zynthian_gui_config.PAD_COLOUR_GROUP exactly
+    STATUS_TIMEOUT_MS = 4000   # untuned guess - how long Solo3/4's OLED status line stays up
+
+    # Group hues mirror zyngui.zynthian_gui_config.PAD_COLOUR_GROUP's own hues
     # (same modulo-16 indexing that screen uses), so a sequence's pad color
-    # matches what the zynpad touchscreen shows for the same group. Playing
-    # uses these at their native (muted-but-saturated) intensity - pushing
-    # every hue's peak channel to 127 looked too bright/washed-out. Stopped
-    # normalizes to full brightness first, then dims - keeps a clear dim/
-    # bright contrast even for hues whose raw value is already quite dark.
-    GROUP_COLORS = [_hex_to_rgb127(c) for c in zynthian_gui_config.PAD_COLOUR_GROUP[:16]]
+    # matches what the zynpad touchscreen shows for the same group - but
+    # boosted in HSV saturation first (see _boost_saturation_rgb127) since
+    # the raw touchscreen palette reads washed-out/pale straight on the pad
+    # LEDs. Playing uses the boosted hue at native intensity - pushing every
+    # hue's peak channel to 127 looked too bright/washed-out even boosted.
+    # Stopped normalizes to full brightness first, then dims - keeps a clear
+    # dim/bright contrast even for hues whose raw value is already quite
+    # dark. Both the saturation factor (1.8) and dim factor (0.08) were
+    # picked on real hardware via the pad-test tester (see
+    # zynthian_ctrldev_akai_fire_stepseq_plan.md) - dim needed to go lower
+    # than a naive guess to actually read as "dim" once saturated.
+    # NB: the actual numbers live in the module-level _GROUP_SATURATION_BOOST/
+    # _GROUP_DIM_FACTOR below, not here - a class-body list comprehension
+    # can't see sibling class attributes by name (comprehensions get their
+    # own scope in Python 3, which class scope isn't part of), so defining
+    # these as class attributes and using them in the comprehensions right
+    # below raises a NameError at import time. Aliased here only so the
+    # tuned values are still visible/greppable on the class itself.
+    SATURATION_BOOST = _GROUP_SATURATION_BOOST
+    DIM_FACTOR = _GROUP_DIM_FACTOR
+    GROUP_COLORS = [
+        _boost_saturation_rgb127(_hex_to_rgb127(c), _GROUP_SATURATION_BOOST)
+        for c in zynthian_gui_config.PAD_COLOUR_GROUP[:16]
+    ]
     GROUP_COLORS_DIM = [
-        tuple(round(c * 0.15) for c in _normalize_rgb127(rgb)) for rgb in GROUP_COLORS
+        tuple(round(c * _GROUP_DIM_FACTOR) for c in _normalize_rgb127(rgb)) for rgb in GROUP_COLORS
     ]
 
     COLOR_EMPTY = (0, 0, 0)
     COLOR_STARTING = (90, 90, 90)   # bright white - SEQ_STARTING / SEQ_RESTARTING
     COLOR_STOPPING = (25, 25, 25)   # dim white - SEQ_STOPPING / SEQ_STOPPINGSYNC
 
-    def __init__(self, state_manager, pads: PadLEDs):
+    def __init__(self, state_manager, leds, pads: PadLEDs, oled_refresh_cb=None):
         super().__init__(state_manager)
+        self._leds = leds
         self._pads = pads
         self._libseq = self._zynseq.libseq
+        self._oled_refresh_cb = oled_refresh_cb  # top-level driver's _refresh_oled, see oled_status()/_cycle_play_mode/_cycle_midi_chan
         # No zynpad-specific use for the 4 knobs/Select/its own push - just
         # decline them (base class no-ops) and let the top-level driver's own
         # shared default handle them, same as every screen with no dedicated
         # mode of its own (see midi_event's _default_cc_change/_default_note_on).
 
-    @staticmethod
-    def _logical_xy(phys_col, phys_row):
-        """Physical pad position -> logical zynseq (col, row): each pair of
-        adjacent physical columns is one logical column (see class comment)."""
+        # Grid/Pattern/Solo1-4 (see note_on/note_off below) can repeat-fire
+        # Note On while physically held - the same real-hardware behavior
+        # PlayHandler._held already guards pad presses against ("a repeated
+        # Note On for a pad that's still physically held"). Paging/scrolling
+        # just clamps harmlessly on a spurious repeat, but
+        # _change_bank/_change_grid_size aren't idempotent - confirmed on
+        # real hardware: a single Grid Right press was corrupting sequence
+        # data, traced to update_bank_grid() actually being called more than
+        # once per press. Solo3/4's own cycle actions have the identical
+        # risk (a repeat would double-cycle). Tracks which of these 8 notes
+        # are currently down.
+        self._held_buttons = set()
+
+        # Momentary BTN_ALT, used as a modifier for Solo3/4's own cycle
+        # direction (Alt+Solo3/4 = backwards) - see note_on below. Same
+        # pattern MixerHandler/StepSeqHandler's own set_alt() already use;
+        # forwarded from the top-level driver's BTN_ALT handling only while
+        # this handler is actually active (see midi_event/_set_current_handler).
+        self._is_alt = False
+
+        # Solo1/Solo2 = copy/paste a pad's pattern (see note_on) - the
+        # source pattern index, or None until Solo1 has been pressed at
+        # least once. Persists across multiple pastes (a real clipboard,
+        # not consumed on use) and across mode switches (no reason to
+        # forget it just because the pad grid isn't showing).
+        self._copy_source_pattern = None
+
+        # Solo3/4's OLED status line (see oled_status()/_show_status()) -
+        # shown after a cycle action, hidden again either on a timeout or
+        # as soon as a *different* pad gets selected (stale info about the
+        # pad you've moved on from isn't useful) - see note_on's plain-pad
+        # path. Same IntervalTimer pattern StepSeqHandler's own
+        # _playhead_timer uses, just one-shot-per-show here (re-add()ing
+        # before it fires acts as a restart, and the callback removes its
+        # own entry so it doesn't keep firing every interval after).
+        self._status_visible = False
+        self._status_timer = IntervalTimer()
+
+    def set_alt(self, state):
+        self._is_alt = state
+
+    def _logical_xy(self, phys_col, phys_row):
+        """Physical pad position -> logical zynseq (col, row) - see class
+        comment for the two layouts this picks between."""
+        if self._zynseq.col_in_bank <= 4:
+            return phys_col, phys_row
         return phys_col // 2, phys_row + (4 if phys_col % 2 else 0)
 
-    @staticmethod
-    def _physical_xy(logical_col, logical_row):
+    def _physical_xy(self, logical_col, logical_row):
         """Inverse of _logical_xy()."""
+        if self._zynseq.col_in_bank <= 4:
+            return logical_col, logical_row
         if logical_row >= 4:
             return logical_col * 2 + 1, logical_row - 4
         return logical_col * 2, logical_row
@@ -1040,6 +1211,22 @@ class ZynpadHandler(ModeHandlerBase):
         for row in range(self.PHYS_ROWS):
             for col in range(self.PHYS_COLS):
                 self._paint_pad(col, row)
+        self._update_leds()
+
+    def _update_leds(self):
+        # Neither of Solo 1-4's two lights has a mute/solo/chain-selection
+        # meaning here (that's Mixer-only) - explicitly set rather than
+        # leaving them at whatever the previous mode left (stale,
+        # misleading): caps get the same dim green idle glow
+        # StepSeqHandler/PlayHandler use, strip goes off. Exception: Solo1's
+        # own cap goes bright once a copy source is armed (see note_on's
+        # BTN_SOLO_1) - a persistent "clipboard has something" indicator.
+        for led in (LED_SOLO_1_BTN, LED_SOLO_2_BTN, LED_SOLO_3_BTN, LED_SOLO_4_BTN):
+            self._leds.led_on(led, LED_GREEN_DULL)
+        if self._copy_source_pattern is not None:
+            self._leds.led_on(LED_SOLO_1_BTN, LED_GREEN_HIGH)
+        for led in (LED_SOLO_1, LED_SOLO_2, LED_SOLO_3, LED_SOLO_4):
+            self._leds.led_off(led)
 
     def _paint_pad(self, col, row):
         note = _pad(row, col)
@@ -1083,6 +1270,114 @@ class ZynpadHandler(ModeHandlerBase):
     def note_on(self, note, velocity, shifted_override=None):
         self._on_shifted_override(shifted_override)
 
+        if note in (BTN_GRID_LEFT, BTN_GRID_RIGHT, BTN_PAT_UP, BTN_PAT_DOWN,
+                    BTN_SOLO_1, BTN_SOLO_2, BTN_SOLO_3, BTN_SOLO_4):
+            if note in self._held_buttons:
+                # Repeat Note On for a button that's still physically held -
+                # see self._held_buttons's own comment in __init__. Consume
+                # (True) rather than decline, same as a fresh press would -
+                # just don't act on it again.
+                return True
+            self._held_buttons.add(note)
+
+        if note == BTN_GRID_LEFT:
+            # Grow/shrink the bank's own grid size (Zynpad menu > Grid
+            # size) - see _change_grid_size for the shrink-confirm caveat.
+            # "Grid" naming this after the pad grid's own shape, "Pattern"
+            # below after Scene, is the more obvious pairing - see class
+            # comment. Momentary flash to high-red on press, back to dull
+            # on release (note_off below) - see _update_mode_leds' own
+            # comment for why these are just "bound"/"not bound", not
+            # boundary-aware.
+            self._leds.led_on(LED_GRID_LEFT, LED_RED_HIGH)
+            self._change_grid_size(-1)
+            return True
+        if note == BTN_GRID_RIGHT:
+            self._leds.led_on(LED_GRID_RIGHT, LED_RED_HIGH)
+            self._change_grid_size(1)
+            return True
+        if note == BTN_PAT_UP:
+            # Previous/next Scene (zynseq bank) - same as the touchscreen's
+            # own Scene param editor (Zynpad menu > Scene).
+            self._leds.led_on(LED_PAT_UP, LED_RED_HIGH)
+            self._change_bank(1)
+            return True
+        if note == BTN_PAT_DOWN:
+            self._leds.led_on(LED_PAT_DOWN, LED_RED_HIGH)
+            self._change_bank(-1)
+            return True
+
+        if note == BTN_SOLO_1:
+            # Copy: stash the selected pad's pattern as the copy source -
+            # see _get_selected_sequence()/_select_pad() (base_ui.py, the
+            # same "selected_pad" field the touchscreen's own pop-up menu
+            # already operates on - kept in sync here by every pad press
+            # below, not just Shift+Pad). Persists across multiple pastes
+            # and mode switches - a real clipboard, not consumed on use.
+            # Cap LED lights up (see _update_leds) once armed. getPattern()
+            # returns -1 for "no pattern at this position" (seen elsewhere
+            # in this file, e.g. StepSeqHandler's own playhead code) -
+            # guard against copying that into copyPattern(), an invalid
+            # index there is unverified/risky, not just a silent no-op.
+            seq = self._get_selected_sequence()
+            pattern = self._libseq.getPattern(self._zynseq.bank, seq, 0, 0)
+            if pattern >= 0:
+                self._copy_source_pattern = pattern
+                self._update_leds()
+            return True
+        if note == BTN_SOLO_2:
+            # Paste: copy source pattern -> the selected pad's own pattern.
+            # Deliberately no confirm-before-overwrite (unlike the grid-
+            # shrink case) - Copy-then-Paste is already a deliberate
+            # two-step gesture, not a single accidental press. Same -1
+            # guard as Copy above, on the destination this time.
+            if self._copy_source_pattern is not None:
+                seq = self._get_selected_sequence()
+                dest_pattern = self._libseq.getPattern(self._zynseq.bank, seq, 0, 0)
+                if dest_pattern >= 0:
+                    self._libseq.copyPattern(self._copy_source_pattern, dest_pattern)
+                    # copyPattern() swaps pattern *content* only - it never
+                    # calls updateSequenceLength() the way addPattern()/
+                    # removePattern() do (confirmed in sequencemanager.cpp),
+                    # so the destination sequence's own cached length
+                    # (Sequence::getLength(), what getSequenceLength()
+                    # returns) goes stale: still whatever it was
+                    # pre-paste. zynthian_gui_zynpad.refresh_pad()'s
+                    # empty/disabled check reads exactly that stale value,
+                    # which is why a paste into a previously-empty pad kept
+                    # drawing as empty until something else recalculated it
+                    # - leaving/re-entering the screen happens to, via
+                    # build_view()'s own libseq.updateSequenceInfo() call.
+                    # Same fix, just proactive: updateSequenceInfo() (->
+                    # updateAllSequenceLengths() - the only length-refresh
+                    # entry point exposed at all, no per-sequence one
+                    # exists) before either repaint reads the now-fresh
+                    # value.
+                    self._libseq.updateSequenceInfo()
+                    self.refresh()
+                    # copyPattern() is also a raw libseq call with no
+                    # signal/notification of its own (confirmed against
+                    # zynthian_gui_patterneditor.do_copy_pattern, which
+                    # explicitly reloads its own canvas right after the
+                    # same call for this exact reason) - self.refresh()
+                    # above only repaints the Fire's own pad grid, the
+                    # touchscreen zynpad screen (if showing) needs its own
+                    # explicit poke too.
+                    zynpad_screen = zynthian_gui_config.zyngui.screens.get("zynpad")
+                    if zynpad_screen is not None:
+                        zynpad_screen.refresh_pad(seq)
+            return True
+        if note == BTN_SOLO_3:
+            # Cycle the selected pad's Play mode (Zynpad menu > Play mode) -
+            # Alt+Solo3 reverses direction, see set_alt().
+            self._cycle_play_mode(-1 if self._is_alt else 1)
+            return True
+        if note == BTN_SOLO_4:
+            # Cycle the selected pad's MIDI channel (Zynpad menu > MIDI
+            # channel), 0-15 wrapping - Alt+Solo4 reverses direction.
+            self._cycle_midi_chan(-1 if self._is_alt else 1)
+            return True
+
         if not (PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64):
             # Not a pad - knob touch, Select push, etc. - nothing
             # zynpad-specific for any of those, decline and let the
@@ -1096,11 +1391,16 @@ class ZynpadHandler(ModeHandlerBase):
             return False
         seq = self._zynseq.get_pad_from_xy(lcol, lrow)
 
-        if self._is_shifted:
-            # Shift+Pad opens StepSeq directly on that pad's pattern, same
-            # shortcut as the APC key25 mk2 driver's own "SHIFT + PAD ->
-            # StepSeq". Screen-driven like BTN_STEP (see midi_event): selects
-            # the pad, then lets SCREEN_PATTERN_EDITOR (which reads zynpad's
+        if self._is_alt:
+            # Alt+Pad opens StepSeq directly on that pad's pattern - was
+            # Shift+Pad (still is in the APC key25 mk2 driver's own
+            # equivalent, "SHIFT + PAD -> StepSeq"), moved to Alt here since
+            # Shift is now sticky (zynthian's own persistent alt_mode
+            # toggle, see _alt_mode()'s docstring) rather than momentary -
+            # Alt (still a plain momentary hold) reads more naturally as a
+            # "hold + tap" gesture than a global sticky toggle would.
+            # Screen-driven like BTN_STEP (see midi_event): selects the pad,
+            # then lets SCREEN_PATTERN_EDITOR (which reads zynpad's
             # now-updated selected_pad) and screen-follow take it from there
             # - so this only actually lands on StepSeq while screen-linked,
             # consistent with every other mode switch in this driver.
@@ -1108,8 +1408,142 @@ class ZynpadHandler(ModeHandlerBase):
             self._state_manager.send_cuia("SCREEN_PATTERN_EDITOR")
             return True
 
+        # Also marks this pad "selected" (same field the touchscreen's own
+        # pop-up menu and Solo1-4 above operate on) - a plain press already
+        # means "this is the pad I'm working with right now", no need for a
+        # separate selection gesture. Hides Solo3/4's OLED status line if
+        # this is actually a *different* pad than was selected before -
+        # see _hide_status()'s own comment - re-pressing the same pad
+        # doesn't disturb it.
+        if self._status_visible and seq != self._get_selected_sequence():
+            self._hide_status()
+        self._select_pad(seq)
         self._libseq.togglePlayState(self._zynseq.bank, seq)
         return True
+
+    def note_off(self, note, shifted_override=None):
+        self._held_buttons.discard(note)
+        if note == BTN_GRID_LEFT:
+            self._leds.led_on(LED_GRID_LEFT, LED_RED_DULL)
+        elif note == BTN_GRID_RIGHT:
+            self._leds.led_on(LED_GRID_RIGHT, LED_RED_DULL)
+        elif note == BTN_PAT_UP:
+            self._leds.led_on(LED_PAT_UP, LED_RED_DULL)
+        elif note == BTN_PAT_DOWN:
+            self._leds.led_on(LED_PAT_DOWN, LED_RED_DULL)
+
+    def _change_bank(self, delta):
+        """Pattern Up/Down - previous/next Scene (zynseq bank). Clamps at
+        1/64 (zynseq.select_bank's own valid range) rather than wrapping -
+        select_bank() itself already refuses out-of-range/no-op values, this
+        just avoids the pointless call. The touchscreen zynpad screen (if
+        showing) self-corrects its own stale self.bank on its next
+        refresh_status() tick - no need to poke it directly."""
+        bank = max(1, min(64, self._zynseq.bank + delta))
+        if bank != self._zynseq.bank:
+            self._zynseq.select_bank(bank)
+            self.refresh()
+
+    def _change_grid_size(self, delta):
+        """Grid Left/Right - grow/shrink the current bank's grid (Zynpad
+        menu's own "Grid size" param, 1-8 columns/rows - zynseq.col_in_bank).
+        Growing is always safe (zynseq.update_bank_grid only adds empty
+        sequences) and goes straight through. Shrinking can delete real
+        sequence content past the new bounds (update_bank_grid truncates) -
+        exactly the case the touchscreen's own Grid size menu guards with a
+        confirm dialog (zynthian_gui_zynpad.set_grid_size) - so mirror that
+        by popping the same dialog via the screen object rather than either
+        silently deleting content or silently refusing. The size check
+        itself is done here directly against libseq (not the screen's own
+        self.bank, which self-corrects on a refresh tick and so could be
+        briefly stale right after _change_bank() runs) - the screen is
+        only reached into for the dialog itself, and its self.bank is
+        force-synced first so the dialog's own re-check operates on the
+        right bank."""
+        columns = max(1, min(8, self._zynseq.col_in_bank + delta))
+        if columns == self._zynseq.col_in_bank:
+            return
+        bank = self._zynseq.bank
+        if columns < self._zynseq.col_in_bank and self._libseq.getSequencesInBank(bank) > columns ** 2:
+            zynpad_screen = zynthian_gui_config.zyngui.screens.get("zynpad")
+            if zynpad_screen is not None:
+                zynpad_screen.bank = bank
+                zynpad_screen.set_grid_size(columns - 1)  # 0-indexed - see its own signature
+            return
+        self._zynseq.update_bank_grid(columns)
+        self.refresh()
+
+    def _cycle_play_mode(self, delta):
+        """Solo3 - cycles the selected pad's Play mode through zynseq's own
+        PLAY_MODES list (Disabled/Oneshot/Loop/Oneshot all/Loop all/Oneshot
+        sync/Loop sync), wrapping either way - same param the touchscreen's
+        own Zynpad menu > Play mode edits."""
+        seq = self._get_selected_sequence()
+        bank = self._zynseq.bank
+        mode = (self._libseq.getPlayMode(bank, seq) + delta) % len(zynseq.PLAY_MODES)
+        self._zynseq.set_play_mode(bank, seq, mode)
+        self._show_status()
+
+    def _cycle_midi_chan(self, delta):
+        """Solo4 - cycles the selected pad's MIDI channel 0-15, wrapping
+        either way - same params the touchscreen's own Zynpad menu > MIDI
+        channel editor edits (zynthian_gui_zynpad.send_controller_value's
+        own 'midi_chan' branch): channel itself, plus Group set equal to
+        it - Group is what actually drives a pad's color
+        (GROUP_COLORS[group % 16], see _group_color), so this is what
+        makes color track channel, matching the touchscreen's own
+        behavior. Repaints this one pad on both the Fire's own grid and
+        the touchscreen (if showing) - same no-signal-of-its-own gap as
+        Paste, see its own comment."""
+        seq = self._get_selected_sequence()
+        bank = self._zynseq.bank
+        chan = (self._libseq.getChannel(bank, seq, 0) + delta) % 16
+        self._libseq.setChannel(bank, seq, 0, chan)
+        self._libseq.setGroup(bank, seq, chan)
+        self._show_status()
+        lcol, lrow = self._zynseq.get_xy_from_pad(seq)
+        if lcol < 8 and lrow < 8:
+            col, row = self._physical_xy(lcol, lrow)
+            self._paint_pad(col, row)
+        zynpad_screen = zynthian_gui_config.zyngui.screens.get("zynpad")
+        if zynpad_screen is not None:
+            zynpad_screen.refresh_pad(seq)
+
+    def _show_status(self):
+        """Solo3/4 call this after changing something - shows the OLED
+        status line (see oled_status()) and (re)starts the auto-hide timer.
+        Re-adding the timer entry before it fires just replaces the pending
+        one (RunTimer.add() semantics), so repeated Solo3/4 presses keep
+        restarting the countdown rather than hiding early."""
+        self._status_visible = True
+        self._status_timer.add("status_hide", self.STATUS_TIMEOUT_MS, self._hide_status)
+        if self._oled_refresh_cb:
+            self._oled_refresh_cb()
+
+    def _hide_status(self, name=None):
+        """Timer callback (STATUS_TIMEOUT_MS after the last _show_status())
+        or called directly when a different pad gets selected (see
+        note_on's plain-pad path) - either way, drop back to the plain
+        centered "Zynpad" label until Solo3/4 is pressed again."""
+        self._status_visible = False
+        self._status_timer.remove("status_hide")
+        if self._oled_refresh_cb:
+            self._oled_refresh_cb()
+
+    def oled_status(self):
+        """Secondary OLED line while Zynpad is active (see the top-level
+        driver's _refresh_oled) - the selected pad's Play mode and MIDI
+        channel, e.g. 'Loop all - Ch 3'. Only while _show_status() has it
+        toggled on (Solo3/4 were pressed recently, same pad still
+        selected) - None here falls back to the plain centered "Zynpad"
+        label, same as every other mode with nothing to show."""
+        if not self._status_visible:
+            return None
+        seq = self._get_selected_sequence()
+        bank = self._zynseq.bank
+        mode = zynseq.PLAY_MODES[self._libseq.getPlayMode(bank, seq)]
+        chan = self._libseq.getChannel(bank, seq, 0) + 1
+        return f"{mode} - Ch {chan}"
 
     # No cc_change override - nothing zynpad-specific for the 4 knobs or
     # Select either, base class declines everything (see note_on above).
@@ -1451,14 +1885,25 @@ class StepSeqHandler(ModeHandlerBase):
 
     def _update_leds(self):
         # Solo1 (Stop) is a momentary action with no state, so no LED for it.
+        # Solo2/3 (mute/solo) match MixerHandler's own red/mute vs
+        # green/solo split (see its _paint_solo_led) instead of both being
+        # plain green - Solo4 (quantize) is unrelated to mute/solo, stays
+        # green as its own simple on/off.
         self._leds.led_off(LED_SOLO_1)
         chain = self._get_chain()
-        self._leds.led_on(LED_SOLO_2, LED_GREEN_HIGH) if chain is not None and self._zynmixer.get_mute(chain.mixer_chan) \
+        self._leds.led_on(LED_SOLO_2, LED_RG_HIGH_RED) if chain is not None and self._zynmixer.get_mute(chain.mixer_chan) \
             else self._leds.led_off(LED_SOLO_2)
-        self._leds.led_on(LED_SOLO_3, LED_GREEN_HIGH) if chain is not None and self._zynmixer.get_solo(chain.mixer_chan) \
+        self._leds.led_on(LED_SOLO_3, LED_RG_HIGH_GREEN) if chain is not None and self._zynmixer.get_solo(chain.mixer_chan) \
             else self._leds.led_off(LED_SOLO_3)
-        self._leds.led_on(LED_SOLO_4, LED_GREEN_HIGH) if self._libseq.getQuantizeNotes() \
+        self._leds.led_on(LED_SOLO_4, LED_RG_HIGH_GREEN) if self._libseq.getQuantizeNotes() \
             else self._leds.led_off(LED_SOLO_4)
+        # Button caps have no meaning of their own here (that's a
+        # Mixer-only, "which of 4 visible chains is selected" thing - see
+        # MixerHandler._paint_solo_led) - explicitly set to a static dim
+        # green idle glow rather than leaving them at whatever Mixer/etc.
+        # last left them (stale, misleading).
+        for led in (LED_SOLO_1_BTN, LED_SOLO_2_BTN, LED_SOLO_3_BTN, LED_SOLO_4_BTN):
+            self._leds.led_on(led, LED_GREEN_DULL)
 
     # ----------------------------------------------------------------------
     # Note add/remove/select/extend - the pad-press state machine
@@ -1683,34 +2128,43 @@ class StepSeqHandler(ModeHandlerBase):
             self._toggle_quantize()
             return True
         if note == BTN_GRID_LEFT:
+            # Momentary flash to high-red on press, back to dull red on
+            # release (note_off below) - see _update_mode_leds' own comment
+            # for why these are just "bound"/"not bound", not boundary-aware.
+            self._leds.led_on(LED_GRID_LEFT, LED_RED_HIGH)
             if self._is_alt:
                 self._cycle_scale(-1)
-            elif shifted_override:
+            elif self._is_shifted:
                 self._adjust_tonic(-1)
             else:
                 self._page_steps(-1)
             return True
         if note == BTN_GRID_RIGHT:
+            self._leds.led_on(LED_GRID_RIGHT, LED_RED_HIGH)
             if self._is_alt:
                 self._cycle_scale(1)
-            elif shifted_override:
+            elif self._is_shifted:
                 self._adjust_tonic(1)
             else:
                 self._page_steps(1)
             return True
         if note == BTN_PAT_UP:
+            self._leds.led_on(LED_PAT_UP, LED_RED_HIGH)
+            # Swapped from the original Shift=page/Alt=octave pairing -
+            # Shift now does the bigger octave jump, Alt the 4-row page.
             if self._is_alt:
-                self._scroll_rows(1, self._degree_count)
-            elif shifted_override:
                 self._scroll_rows(1, 4)
+            elif self._is_shifted:
+                self._scroll_rows(1, self._degree_count)
             else:
                 self._scroll_rows(1)
             return True
         if note == BTN_PAT_DOWN:
+            self._leds.led_on(LED_PAT_DOWN, LED_RED_HIGH)
             if self._is_alt:
-                self._scroll_rows(-1, self._degree_count)
-            elif shifted_override:
                 self._scroll_rows(-1, 4)
+            elif self._is_shifted:
+                self._scroll_rows(-1, self._degree_count)
             else:
                 self._scroll_rows(-1)
             return True
@@ -1721,6 +2175,14 @@ class StepSeqHandler(ModeHandlerBase):
     def note_off(self, note, shifted_override=None):
         if PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64:
             self._on_grid_release(note)
+        elif note == BTN_GRID_LEFT:
+            self._leds.led_on(LED_GRID_LEFT, LED_RED_DULL)
+        elif note == BTN_GRID_RIGHT:
+            self._leds.led_on(LED_GRID_RIGHT, LED_RED_DULL)
+        elif note == BTN_PAT_UP:
+            self._leds.led_on(LED_PAT_UP, LED_RED_DULL)
+        elif note == BTN_PAT_DOWN:
+            self._leds.led_on(LED_PAT_DOWN, LED_RED_DULL)
 
     def cc_change(self, ccnum, ccval):
         if ccnum == KNOB_SELECT:
@@ -1848,8 +2310,12 @@ class PlayHandler(ModeHandlerBase):
     COLOR_RECORD = (90, 0, 0)
     # Piano layout only: black keys get their own color (DrivenByMoss uses
     # "the selected track's color" - we have no such concept here, so a
-    # fixed, visually-distinct hue instead).
-    COLOR_BLACK_KEY = (40, 0, 40)
+    # fixed, visually-distinct hue instead). Equal R/B (40, 0, 40) read as
+    # plain magenta rather than purple and was fairly dim (peak 40/127) -
+    # more blue than red plus a brighter peak reads as purple instead.
+    # Untested on hardware (no device attached to this host right now) -
+    # nudge further once seen live.
+    COLOR_BLACK_KEY = (45, 0, 90)
 
     # Piano layout: standard 7-white-key/5-black-key octave. Each black pad
     # is drawn above its UPPER white neighbor (C# above D, D# above E, F#
@@ -1999,13 +2465,25 @@ class PlayHandler(ModeHandlerBase):
         return self._scale_label if self._chromatic else None
 
     def _update_leds(self):
+        # Solo2/3 (mute/solo) match MixerHandler's own red/mute vs
+        # green/solo split (see its _paint_solo_led) instead of both being
+        # plain green.
         chain = self._chain_manager.get_active_chain()
-        self._leds.led_on(LED_SOLO_2, LED_GREEN_HIGH) if chain is not None and self._zynmixer.get_mute(chain.mixer_chan) \
+        self._leds.led_on(LED_SOLO_2, LED_RG_HIGH_RED) if chain is not None and self._zynmixer.get_mute(chain.mixer_chan) \
             else self._leds.led_off(LED_SOLO_2)
-        self._leds.led_on(LED_SOLO_3, LED_GREEN_HIGH) if chain is not None and self._zynmixer.get_solo(chain.mixer_chan) \
+        self._leds.led_on(LED_SOLO_3, LED_RG_HIGH_GREEN) if chain is not None and self._zynmixer.get_solo(chain.mixer_chan) \
             else self._leds.led_off(LED_SOLO_3)
         self._leds.led_off(LED_SOLO_1)
-        self._leds.led_off(LED_SOLO_4)  # unbound for now
+        # Solo4 (quantize in StepSeq) is deliberately left unbound here -
+        # there's no "grid" to quantize against while playing live notes,
+        # so mirroring StepSeq's binding would be functionally inert. Its
+        # strip stays off (no state to show); its cap still gets the same
+        # dim green idle glow as every other Solo N below.
+        self._leds.led_off(LED_SOLO_4)
+        # Button caps have no meaning of their own here - see StepSeqHandler's
+        # own _update_leds for why (Mixer-only concept), same fix.
+        for led in (LED_SOLO_1_BTN, LED_SOLO_2_BTN, LED_SOLO_3_BTN, LED_SOLO_4_BTN):
+            self._leds.led_on(led, LED_GREEN_DULL)
 
     def _send_note(self, note_val, velocity, channel):
         """Queue a Note On (velocity 0 = off, standard MIDI convention - no
@@ -2209,15 +2687,22 @@ class PlayHandler(ModeHandlerBase):
             self._toggle_solo()
             return True
         if note == BTN_GRID_LEFT:
+            # Momentary flash to high-red on press, back to dull red on
+            # release (note_off below) - see _update_mode_leds' own comment
+            # for why these are just "bound"/"not bound", not boundary-aware.
+            self._leds.led_on(LED_GRID_LEFT, LED_RED_HIGH)
             self._switch_chain(-1)
             return True
         if note == BTN_GRID_RIGHT:
+            self._leds.led_on(LED_GRID_RIGHT, LED_RED_HIGH)
             self._switch_chain(1)
             return True
         if note == BTN_PAT_UP:
+            self._leds.led_on(LED_PAT_UP, LED_RED_HIGH)
             self._cycle_scale(1)
             return True
         if note == BTN_PAT_DOWN:
+            self._leds.led_on(LED_PAT_DOWN, LED_RED_HIGH)
             self._cycle_scale(-1)
             return True
 
@@ -2241,6 +2726,18 @@ class PlayHandler(ModeHandlerBase):
         return False
 
     def note_off(self, note, shifted_override=None):
+        if note == BTN_GRID_LEFT:
+            self._leds.led_on(LED_GRID_LEFT, LED_RED_DULL)
+            return
+        if note == BTN_GRID_RIGHT:
+            self._leds.led_on(LED_GRID_RIGHT, LED_RED_DULL)
+            return
+        if note == BTN_PAT_UP:
+            self._leds.led_on(LED_PAT_UP, LED_RED_DULL)
+            return
+        if note == BTN_PAT_DOWN:
+            self._leds.led_on(LED_PAT_DOWN, LED_RED_DULL)
+            return
         if not (PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64):
             return
         info = self._held.pop(note, None)
@@ -2300,7 +2797,7 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         # midiproc_task drains and emits them on its own real-time JACK port.
         self._play_notes_queue = mp.Queue()
         self._mixer_handler = MixerHandler(state_manager, self._leds, self._pads)
-        self._zynpad_handler = ZynpadHandler(state_manager, self._pads)
+        self._zynpad_handler = ZynpadHandler(state_manager, self._leds, self._pads, self._refresh_oled)
         self._stepseq_handler = StepSeqHandler(state_manager, self._leds, self._pads, self._refresh_oled)
         self._play_handler = PlayHandler(state_manager, self._leds, self._pads, self._play_notes_queue,
                                           self._refresh_oled)
@@ -2660,6 +3157,24 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         # BTN_PATTERN_SONG handling) is actually showing.
         self._leds.led_on(LED_METRONOME, LED_YG_HIGH_YELLOW if self._last_screen == "tempo" else LED_YG_DULL_YELLOW)
 
+        # Grid Left/Right and Pattern Up/Down (red-only family - only off/
+        # dull-red/high-red available, no yellow variant) - meaning changes
+        # per mode *and* per modifier held (see each handler's own note_on),
+        # too overloaded for a 2-state LED to represent accurately, so this
+        # is deliberately just "is this button bound to anything right now"
+        # rather than boundary-aware: dull red while the current mode uses
+        # it at all, off where it's a no-op (nothing is, right now - every
+        # mode binds both). The momentary flash to high-red on an actual
+        # press (mirroring Alt/Bank's own touch-flash) is each handler's own
+        # note_on/note_off, not here - this only sets the idle baseline.
+        grid_bound = self._current_handler in (self._mixer_handler, self._stepseq_handler,
+                                                self._play_handler, self._zynpad_handler)
+        pattern_bound = self._current_handler in (self._stepseq_handler, self._play_handler, self._zynpad_handler)
+        for led in (LED_GRID_LEFT, LED_GRID_RIGHT):
+            self._leds.led_on(led, LED_RED_DULL) if grid_bound else self._leds.led_off(led)
+        for led in (LED_PAT_UP, LED_PAT_DOWN):
+            self._leds.led_on(led, LED_RED_DULL) if pattern_bound else self._leds.led_off(led)
+
     def _pattern_is_playing(self):
         """Whether any sequence, in any bank, is currently playing - see the
         Play LED comment above for why this needs its own check, separate
@@ -2737,8 +3252,12 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 # docstring. self.refresh() updates Shift's own LED
                 # (_update_mode_leds) plus whatever the current handler
                 # shows for alt_mode (e.g. Mixer's volume-vs-balance view).
+                # No explicit push into any handler's own _is_shifted
+                # needed - every note_on already re-syncs it fresh via
+                # _on_shifted_override() before reading it, each handler's
+                # own copy is only ever consulted synchronously within that
+                # same call, never read asynchronously in between presses.
                 _toggle_alt_mode()
-                self._mixer_handler.on_shift_changed(_alt_mode())
                 self.refresh()
                 return True
             if note == BTN_ALT:
@@ -2750,14 +3269,17 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 self._leds.led_on(LED_ALT, LED_Y_HIGH)
                 # Alt+Browser (screen-link toggle), Alt+Note (Snapshot) and
                 # Alt+Perform (ZS3) work from any mode, so _is_alt itself is
-                # tracked unconditionally above - but only forward into MixerHandler
-                # (its Alt+Solo-N = toggle solo modifier) or StepSeqHandler
-                # (its Alt+Filter = play chance modifier) while one of them
-                # is actually the active mode.
+                # tracked unconditionally above - but only forward into
+                # MixerHandler (its Alt+Solo-N = toggle solo modifier),
+                # StepSeqHandler (its Alt+Filter = play chance modifier) or
+                # ZynpadHandler (its Alt+Solo3/4 = cycle backwards) while
+                # one of them is actually the active mode.
                 if self._current_handler is self._mixer_handler:
                     self._mixer_handler.set_alt(True)
                 elif self._current_handler is self._stepseq_handler:
                     self._stepseq_handler.set_alt(True)
+                elif self._current_handler is self._zynpad_handler:
+                    self._zynpad_handler.set_alt(True)
                 return True
             if note == BTN_STEP:
                 if self._current_handler is self._play_handler:
@@ -2964,6 +3486,8 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                     self._mixer_handler.set_alt(False)
                 elif self._current_handler is self._stepseq_handler:
                     self._stepseq_handler.set_alt(False)
+                elif self._current_handler is self._zynpad_handler:
+                    self._zynpad_handler.set_alt(False)
                 return True
             if note in (BTN_PLAY, BTN_STOP):
                 self._btn_timer.is_released(note)
@@ -3078,15 +3602,18 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         self._current_handler = handler
         if handler is self._mixer_handler:
             # Pick up Alt if it was already held before switching in (its
-            # press/release edges only forward to MixerHandler/StepSeqHandler
-            # while one of them is already the active mode - see BTN_ALT
-            # handling).
+            # press/release edges only forward to MixerHandler/StepSeqHandler/
+            # ZynpadHandler while one of them is already the active mode -
+            # see BTN_ALT handling).
             self._mixer_handler.set_alt(self._is_alt)
         elif handler is self._stepseq_handler:
             self._stepseq_handler.set_alt(self._is_alt)
-        # set_active() is a no-op for every handler except PlayHandler, which
-        # uses it to stop any still-sounding notes on the way out - harmless
-        # to call unconditionally on both ends of the switch.
+        elif handler is self._zynpad_handler:
+            self._zynpad_handler.set_alt(self._is_alt)
+        # set_active() is a no-op for most handlers - the exceptions being
+        # PlayHandler (stops any still-sounding notes on the way out) and
+        # StepSeqHandler (starts/stops its playhead poll timer) - harmless
+        # to call unconditionally on both ends of the switch either way.
         old_handler.set_active(False)
         handler.set_active(True)
         # Unconditional full clear rather than each handler tracking which

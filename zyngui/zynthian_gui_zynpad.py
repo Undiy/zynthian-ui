@@ -595,7 +595,7 @@ class zynthian_gui_zynpad(zynthian_gui_base.zynthian_gui_base):
         if self.redrawing and not force:
             return
 
-        force |= self.zynseq.bank != self.bank
+        force |= self.zynseq.bank != self.bank or self.columns != self.zynseq.col_in_bank
         if force:
             self.bank = self.zynseq.bank
             self.set_title(f"Scene {self.bank}")
