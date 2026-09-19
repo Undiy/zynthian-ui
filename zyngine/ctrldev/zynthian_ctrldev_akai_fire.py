@@ -52,6 +52,7 @@
 # ******************************************************************************
 
 import os
+import math
 import time
 import json
 import queue
@@ -64,7 +65,7 @@ from PIL import Image, ImageDraw, ImageFont
 from zynlibs.zynseq import zynseq
 from zynlibs.zynaudioplayer import zynaudioplayer
 from zyngine.ctrldev.zynthian_ctrldev_base import zynthian_ctrldev_base, zynthian_ctrldev_zynmixer, zynthian_ctrldev_zynpad
-from zyngine.ctrldev.zynthian_ctrldev_base_extended import ButtonTimer, CONST, IntervalTimer
+from zyngine.ctrldev.zynthian_ctrldev_base_extended import ButtonTimer, CONST, IntervalTimer, RunTimer
 from zyngine.ctrldev.zynthian_ctrldev_base_ui import ModeHandlerBase
 from zyngine.zynthian_signal_manager import zynsigman
 from zyncoder.zyncore import lib_zyncore
@@ -277,6 +278,14 @@ def _pad(row, col):
 # on zyngui screen modules) - used by PlayHandler for its OLED scale/tonic
 # status line.
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+
+
+def _note_name(note):
+    """MIDI note number -> name+octave, e.g. 60 -> 'C4' - same convention
+    zynthian_gui_patterneditor.py's own keymap building already uses
+    (NOTE_NAMES[note % 12] + str(note // 12 - 1)), used here by
+    StepSeqHandler's OLED pitch/transpose readout."""
+    return f"{NOTE_NAMES[note % 12]}{note // 12 - 1}"
 
 
 def _alt_mode():
@@ -624,6 +633,101 @@ def _select_knob_arrow(state_manager, ccval, is_alt=False):
         state_manager.send_cuia("ARROW_UP" if delta > 0 else "ARROW_DOWN")
 
 
+class TransientOledLine:
+    """Shared timed-auto-hide OLED secondary-line helper: show(text) makes
+    it the current mode's secondary OLED line (see the top-level driver's
+    own _refresh_oled/oled_status hook) for TIMEOUT_MS, then automatically
+    reverts to whatever oled_status() would otherwise return (a handler's
+    own permanent status - e.g. StepSeqHandler's scale/tonic - or nothing).
+    hide() drops it immediately instead, for "this got stale" cases (e.g.
+    a different pad got selected).
+
+    Uses RunTimer for the auto-hide countdown, NOT IntervalTimer, despite
+    IntervalTimer being what every other per-handler timer in this file
+    uses (StepSeqHandler's own _playhead_timer, the top-level driver's own
+    _oled_timer anti-sleep keepalive) - confirmed by direct measurement
+    (instantiate both, call add(), time the callback) that they mean two
+    different things: IntervalTimer.add(name, ms, cb) fires ALMOST
+    IMMEDIATELY, then repeats every ms after that (harmless/expected for
+    those two - a periodic poll firing once immediately on activation
+    costs nothing) - not "wait ms, then fire once", which is what a
+    delayed auto-hide actually needs. RunTimer.add(name, ms, cb) is the
+    correct one-shot primitive: fires once, at the right time, then
+    removes itself (also confirmed by direct measurement, including that
+    re-add()ing before it fires restarts the countdown from the new
+    call - so repeated show() calls correctly keep pushing hide()
+    later rather than letting it fire early).
+
+    Originally ZynpadHandler's own bespoke _show_status/_hide_status/
+    _status_visible/_status_timer (Solo3/4's Play-mode/MIDI-channel
+    readout) - pulled out here once MixerHandler/StepSeqHandler needed the
+    identical shape for a live parameter-value readout on knob/pad edits.
+    That original version used IntervalTimer for its own auto-hide too, so
+    it was almost certainly hiding near-instantly rather than staying up
+    for STATUS_TIMEOUT_MS this whole time - fixed here along with
+    everything else moving to this shared class. Owns its own RunTimer
+    (own background thread) rather than sharing one across handler
+    instances - simpler to reason about, consistent with the file's
+    existing per-handler-timer precedent.
+
+    Also rate-limits show()'s own OLED repaint to at most one per
+    MIN_REFRESH_MS: a fast knob spin can call show() far faster than the
+    OLED's own encode+SysEx-send cost can keep up with (or than a human
+    can read), and unlike every existing use of _oled_refresh_cb before
+    this (discrete, rare events - a mode switch, a button press), a knob
+    is a genuinely hot path. Calls inside the throttle window just update
+    .text and, if nothing's already pending, arm one trailing repaint for
+    the moment the window reopens - so a sustained fast turn still gets
+    steady ~MIN_REFRESH_MS-spaced updates rather than either flooding the
+    OLED or freezing on a stale mid-turn value until the knob stops."""
+
+    TIMEOUT_MS = 1500
+    MIN_REFRESH_MS = 100
+
+    def __init__(self, oled_refresh_cb, timeout_ms=None):
+        self._oled_refresh_cb = oled_refresh_cb
+        self._timeout_ms = self.TIMEOUT_MS if timeout_ms is None else timeout_ms
+        self._timer = RunTimer()
+        self._last_refresh_ts = 0.0
+        self.text = None
+
+    def show(self, text):
+        self.text = text
+        # Re-add()ing before it fires just restarts the countdown (see the
+        # class comment) - repeated calls keep pushing the auto-hide out.
+        self._timer.add("hide", self._timeout_ms, self._on_hide_timeout)
+        elapsed_ms = (time.time() - self._last_refresh_ts) * 1000
+        if elapsed_ms >= self.MIN_REFRESH_MS:
+            self._refresh_now()
+        elif "coalesce" not in self._timer:
+            # Already inside the throttle window and nothing pending yet -
+            # arm one trailing repaint for exactly when the window reopens
+            # (not another full MIN_REFRESH_MS from *this* call - that
+            # would let a sustained fast turn keep pushing it out forever
+            # and never actually repaint until the turn stops).
+            self._timer.add("coalesce", self.MIN_REFRESH_MS - elapsed_ms, self._on_coalesce)
+
+    def hide(self):
+        if self.text is None:
+            return
+        self.text = None
+        self._timer.remove("hide")
+        self._timer.remove("coalesce")
+        self._refresh_now()
+
+    def _refresh_now(self):
+        self._timer.remove("coalesce")  # moot now - this call already has fresh text
+        self._last_refresh_ts = time.time()
+        if self._oled_refresh_cb:
+            self._oled_refresh_cb()
+
+    def _on_hide_timeout(self, name=None):
+        self.hide()
+
+    def _on_coalesce(self, name=None):
+        self._refresh_now()
+
+
 # --------------------------------------------------------------------------
 # Handle Mixer (active on the audio_mixer screen)
 # --------------------------------------------------------------------------
@@ -678,7 +782,7 @@ class MixerHandler(ModeHandlerBase):
     # smallest one, barely finer than the 4 this replaces.
     FINE_STEPS = 5
 
-    def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs):
+    def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs, oled_refresh_cb=None):
         super().__init__(state_manager)
         self._leds = leds
         self._pads = pads
@@ -692,10 +796,49 @@ class MixerHandler(ModeHandlerBase):
         active_chain = self._chain_manager.get_active_chain()
         self._active_chain = active_chain.chain_id if active_chain else 0
 
+        # Live Volume/Balance readout (see _show_value/oled_status) while a
+        # knob or bar pad is actually changing one - see TransientOledLine.
+        self._oled_value = TransientOledLine(oled_refresh_cb)
+
     def refresh(self):
         for pos in range(4):
             self._paint_solo_led(pos)
             self._paint_row(pos)
+
+    def _show_value(self, chain):
+        """Called after a knob turn or bar-pad tap actually changes
+        Volume/Balance (see cc_change/_on_bar_pad) - shows the new value on
+        the OLED (see oled_status()) for a couple seconds. _alt_mode()
+        decides which one to read back, same as _paint_row uses it to
+        decide which one to paint."""
+        if _alt_mode():
+            self._oled_value.show(self._format_balance(self._zynmixer.get_balance(chain.mixer_chan)))
+        else:
+            self._oled_value.show(self._format_volume(self._zynmixer.get_level(chain.mixer_chan)))
+
+    @staticmethod
+    def _format_volume(level):
+        """level: zynmixer's own 0.0-1.0 linear scale. Matches
+        zynthian_gui_mixer's own title-bar readout exactly (same dB
+        formula, same -inf fallback at 0)."""
+        if level <= 0:
+            return "Volume: -∞dB"
+        return f"Volume: {20 * math.log10(level):.2f}dB"
+
+    @staticmethod
+    def _format_balance(balance):
+        """balance: zynmixer's own -1.0..1.0 linear scale. Percent, not
+        dB/L-R - matches zynthian_gui_mixer's own title-bar readout
+        (int(value*100)) other than rounding instead of truncating."""
+        return f"Balance: {round(balance * 100)}%"
+
+    def oled_status(self):
+        """Secondary OLED line while Mixer is active (see the top-level
+        driver's _refresh_oled) - only the transient Volume/Balance
+        readout from _show_value() above; None (falls back to the plain
+        centered "Mixer" label) once that's timed out, same as every mode
+        with nothing to show."""
+        return self._oled_value.text
 
     def _regular_chain_ids(self):
         """Ordered chain IDs excluding Main (chain_id 0). Main's own slot in
@@ -834,6 +977,7 @@ class MixerHandler(ModeHandlerBase):
                 self._zynmixer.set_balance(chain.mixer_chan, 0)
                 self._last_tapped_col[pos] = None
                 self._paint_row(pos)
+                self._show_value(chain)
                 return True
 
         # Tapping the same physical pad as last time on this row = fine
@@ -872,6 +1016,7 @@ class MixerHandler(ModeHandlerBase):
             self._zynmixer.set_level(chain.mixer_chan, self._volume_from_fine_pos(fine_pos) / 100)
 
         self._paint_row(pos)
+        self._show_value(chain)
         return True
 
     def _off_bar_pad(self, note):
@@ -976,6 +1121,7 @@ class MixerHandler(ModeHandlerBase):
             value = max(0, min(value + delta, 100))
             self._zynmixer.set_level(chain.mixer_chan, value / 100)
             self._paint_active_row()
+            self._show_value(chain)
             return True
 
         if ccnum == KNOB_PAN:
@@ -983,6 +1129,7 @@ class MixerHandler(ModeHandlerBase):
             value = max(-100, min(value + delta, 100))
             self._zynmixer.set_balance(chain.mixer_chan, value / 100)
             self._paint_active_row()
+            self._show_value(chain)
             return True
 
     def _pos_of_chain_id(self, chain_id):
@@ -1145,7 +1292,6 @@ class ZynpadHandler(ModeHandlerBase):
         self._leds = leds
         self._pads = pads
         self._libseq = self._zynseq.libseq
-        self._oled_refresh_cb = oled_refresh_cb  # top-level driver's _refresh_oled, see oled_status()/_cycle_play_mode/_cycle_midi_chan
         # No zynpad-specific use for the 4 knobs/Select/its own push - just
         # decline them (base class no-ops) and let the top-level driver's own
         # shared default handle them, same as every screen with no dedicated
@@ -1178,16 +1324,11 @@ class ZynpadHandler(ModeHandlerBase):
         # forget it just because the pad grid isn't showing).
         self._copy_source_pattern = None
 
-        # Solo3/4's OLED status line (see oled_status()/_show_status()) -
-        # shown after a cycle action, hidden again either on a timeout or
-        # as soon as a *different* pad gets selected (stale info about the
-        # pad you've moved on from isn't useful) - see note_on's plain-pad
-        # path. Same IntervalTimer pattern StepSeqHandler's own
-        # _playhead_timer uses, just one-shot-per-show here (re-add()ing
-        # before it fires acts as a restart, and the callback removes its
-        # own entry so it doesn't keep firing every interval after).
-        self._status_visible = False
-        self._status_timer = IntervalTimer()
+        # Solo3/4's OLED status line (see oled_status()) - shown after a
+        # cycle action, hidden again either on a timeout or as soon as a
+        # *different* pad gets selected (stale info about the pad you've
+        # moved on from isn't useful) - see note_on's plain-pad path.
+        self._oled_status = TransientOledLine(oled_refresh_cb, self.STATUS_TIMEOUT_MS)
 
     def set_alt(self, state):
         self._is_alt = state
@@ -1413,10 +1554,10 @@ class ZynpadHandler(ModeHandlerBase):
         # means "this is the pad I'm working with right now", no need for a
         # separate selection gesture. Hides Solo3/4's OLED status line if
         # this is actually a *different* pad than was selected before -
-        # see _hide_status()'s own comment - re-pressing the same pad
-        # doesn't disturb it.
-        if self._status_visible and seq != self._get_selected_sequence():
-            self._hide_status()
+        # stale info about the pad you've moved on from isn't useful -
+        # re-pressing the same pad doesn't disturb it.
+        if self._oled_status.text is not None and seq != self._get_selected_sequence():
+            self._oled_status.hide()
         self._select_pad(seq)
         self._libseq.togglePlayState(self._zynseq.bank, seq)
         return True
@@ -1482,7 +1623,7 @@ class ZynpadHandler(ModeHandlerBase):
         bank = self._zynseq.bank
         mode = (self._libseq.getPlayMode(bank, seq) + delta) % len(zynseq.PLAY_MODES)
         self._zynseq.set_play_mode(bank, seq, mode)
-        self._show_status()
+        self._oled_status.show(self._status_text(seq))
 
     def _cycle_midi_chan(self, delta):
         """Solo4 - cycles the selected pad's MIDI channel 0-15, wrapping
@@ -1500,7 +1641,7 @@ class ZynpadHandler(ModeHandlerBase):
         chan = (self._libseq.getChannel(bank, seq, 0) + delta) % 16
         self._libseq.setChannel(bank, seq, 0, chan)
         self._libseq.setGroup(bank, seq, chan)
-        self._show_status()
+        self._oled_status.show(self._status_text(seq))
         lcol, lrow = self._zynseq.get_xy_from_pad(seq)
         if lcol < 8 and lrow < 8:
             col, row = self._physical_xy(lcol, lrow)
@@ -1509,41 +1650,22 @@ class ZynpadHandler(ModeHandlerBase):
         if zynpad_screen is not None:
             zynpad_screen.refresh_pad(seq)
 
-    def _show_status(self):
-        """Solo3/4 call this after changing something - shows the OLED
-        status line (see oled_status()) and (re)starts the auto-hide timer.
-        Re-adding the timer entry before it fires just replaces the pending
-        one (RunTimer.add() semantics), so repeated Solo3/4 presses keep
-        restarting the countdown rather than hiding early."""
-        self._status_visible = True
-        self._status_timer.add("status_hide", self.STATUS_TIMEOUT_MS, self._hide_status)
-        if self._oled_refresh_cb:
-            self._oled_refresh_cb()
-
-    def _hide_status(self, name=None):
-        """Timer callback (STATUS_TIMEOUT_MS after the last _show_status())
-        or called directly when a different pad gets selected (see
-        note_on's plain-pad path) - either way, drop back to the plain
-        centered "Zynpad" label until Solo3/4 is pressed again."""
-        self._status_visible = False
-        self._status_timer.remove("status_hide")
-        if self._oled_refresh_cb:
-            self._oled_refresh_cb()
-
-    def oled_status(self):
-        """Secondary OLED line while Zynpad is active (see the top-level
-        driver's _refresh_oled) - the selected pad's Play mode and MIDI
-        channel, e.g. 'Loop all - Ch 3'. Only while _show_status() has it
-        toggled on (Solo3/4 were pressed recently, same pad still
-        selected) - None here falls back to the plain centered "Zynpad"
-        label, same as every other mode with nothing to show."""
-        if not self._status_visible:
-            return None
-        seq = self._get_selected_sequence()
+    def _status_text(self, seq):
+        """The selected pad's Play mode + MIDI channel, e.g. 'Loop all -
+        Ch 3' - shared by _cycle_play_mode/_cycle_midi_chan (Solo3/4)."""
         bank = self._zynseq.bank
         mode = zynseq.PLAY_MODES[self._libseq.getPlayMode(bank, seq)]
         chan = self._libseq.getChannel(bank, seq, 0) + 1
         return f"{mode} - Ch {chan}"
+
+    def oled_status(self):
+        """Secondary OLED line while Zynpad is active (see the top-level
+        driver's _refresh_oled) - the transient Play-mode/MIDI-channel
+        readout from _status_text() above, shown via _oled_status
+        (Solo3/4 were pressed recently, same pad still selected). None
+        (falls back to the plain centered "Zynpad" label) once that's
+        timed out or hidden, same as every mode with nothing to show."""
+        return self._oled_status.text
 
     # No cc_change override - nothing zynpad-specific for the 4 knobs or
     # Select either, base class declines everything (see note_on above).
@@ -1621,6 +1743,12 @@ class StepSeqHandler(ModeHandlerBase):
         self._libseq = self._zynseq.libseq
         self._knobs_ease = KnobJitterFilter()
         self._is_alt = False
+
+        # Live parameter-value readout (Velocity/Duration/Stutter/Chance/
+        # Pitch, see cc_change) while a knob is actually changing one -
+        # takes over the OLED's second line from the scale/tonic label
+        # below for a couple seconds, see oled_status().
+        self._oled_value = TransientOledLine(oled_refresh_cb)
 
         self._scale_label = "Chromatic"  # OLED status line, see _load_keymap()/oled_status()
         self._tonic = 0          # root note (0-11), see _load_keymap()/_paint_pad's tonic-row tint
@@ -1756,9 +1884,11 @@ class StepSeqHandler(ModeHandlerBase):
 
     def oled_status(self):
         """Secondary OLED line while StepSeq is active (see the top-level
-        driver's _refresh_oled) - the current pattern's scale/tonic, e.g.
-        'C Major', or 'Chromatic'."""
-        return self._scale_label
+        driver's _refresh_oled) - the transient Velocity/Duration/Stutter/
+        Chance/Pitch readout from cc_change (see self._oled_value) takes
+        priority for a couple seconds after a knob turn; otherwise the
+        current pattern's scale/tonic, e.g. 'C Major', or 'Chromatic'."""
+        return self._oled_value.text or self._scale_label
 
     def _keymap_index(self, phys_row):
         """Physical pad row (0=top) -> index into self._keymap, or None if
@@ -1984,42 +2114,80 @@ class StepSeqHandler(ModeHandlerBase):
             return set(self._selected_notes)
         return {self._last_note} if self._last_note is not None else set()
 
+    def _show_edit(self, label, unit_fmt, changed):
+        """Shared OLED readout for the 5 _adjust_* methods below - changed:
+        [(step, note_val, new_value), ...] actually written this call
+        (skipping any target that turned out to be an empty cell, e.g.
+        after a delete raced a knob turn). All 5 apply the SAME delta to
+        every target in _current_targets(), but each started from a
+        different absolute value, so there's no single "the" value once
+        more than one note is targeted - shows self._last_note's own
+        resulting value if it's among the changed notes (the one most
+        recently tapped/added, so probably what's being watched), else
+        the lowest (step, note_val) for determinism, with a "(xN)" suffix
+        whenever more than one note actually changed."""
+        if not changed:
+            return
+        by_key = {(step, note_val): value for step, note_val, value in changed}
+        rep_key = self._last_note if self._last_note in by_key else min(by_key)
+        text = f"{label}: {unit_fmt.format(by_key[rep_key])}"
+        if len(by_key) > 1:
+            text += f" (×{len(by_key)})"
+        self._oled_value.show(text)
+
     def _adjust_velocity(self, delta):
+        changed = []
         for step, note_val in self._current_targets():
             vel = self._libseq.getNoteVelocity(step, note_val)
             if vel <= 0:
                 continue
-            self._libseq.setNoteVelocity(step, note_val, max(1, min(127, vel + delta)))
+            vel = max(1, min(127, vel + delta))
+            self._libseq.setNoteVelocity(step, note_val, vel)
+            changed.append((step, note_val, vel))
         self._paint_all()
+        self._show_edit("Velocity", "{}", changed)
 
     def _adjust_duration(self, delta):
+        changed = []
         for step, note_val in self._current_targets():
             dur = self._libseq.getNoteDuration(step, note_val)
             if dur <= 0:
                 continue
-            self._set_note_duration(step, note_val, max(1, min(self._steps, dur + delta)))
+            dur = max(1, min(self._steps, dur + delta))
+            self._set_note_duration(step, note_val, dur)
+            changed.append((step, note_val, dur))
         self._paint_all()
+        self._show_edit("Duration", "{} steps", changed)
 
     def _adjust_stutter_count(self, delta):
+        changed = []
         for step, note_val in self._current_targets():
             if self._libseq.getNoteDuration(step, note_val) <= 0:
                 continue
             val = max(0, self._libseq.getStutterCount(step, note_val) + delta)
             self._libseq.setStutterCount(step, note_val, val)
+            changed.append((step, note_val, val))
+        self._show_edit("Stutter", "{}", changed)
 
     def _adjust_stutter_dur(self, delta):
+        changed = []
         for step, note_val in self._current_targets():
             if self._libseq.getNoteDuration(step, note_val) <= 0:
                 continue
             val = max(1, self._libseq.getStutterDur(step, note_val) + delta)
             self._libseq.setStutterDur(step, note_val, val)
+            changed.append((step, note_val, val))
+        self._show_edit("Stutter dur", "{}", changed)
 
     def _adjust_chance(self, delta):
+        changed = []
         for step, note_val in self._current_targets():
             if self._libseq.getNoteDuration(step, note_val) <= 0:
                 continue
             val = max(0, min(100, self._libseq.getNotePlayChance(step, note_val) + delta))
             self._libseq.setNotePlayChance(step, note_val, val)
+            changed.append((step, note_val, val))
+        self._show_edit("Chance", "{}%", changed)
 
     def _adjust_pitch(self, delta):
         """Rigid transpose of the whole selection (or _last_note alone) by
@@ -2065,9 +2233,16 @@ class StepSeqHandler(ModeHandlerBase):
 
         if self._selected_notes:
             self._selected_notes = new_selected
+            rep_note = min(new_selected)[1]
         else:
             self._last_note = new_last
+            rep_note = new_last[1]
         self._paint_all()
+
+        text = f"Pitch: {_note_name(rep_note)}"
+        if len(plan) > 1:
+            text += f" (×{len(plan)})"
+        self._oled_value.show(text)
 
     # ----------------------------------------------------------------------
     # Solo 1-4: Stop / Mute / Solo / Quantize (see plan doc)
@@ -2796,7 +2971,7 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         # in the base class) - PlayHandler puts (status, note, vel) tuples here,
         # midiproc_task drains and emits them on its own real-time JACK port.
         self._play_notes_queue = mp.Queue()
-        self._mixer_handler = MixerHandler(state_manager, self._leds, self._pads)
+        self._mixer_handler = MixerHandler(state_manager, self._leds, self._pads, self._refresh_oled)
         self._zynpad_handler = ZynpadHandler(state_manager, self._leds, self._pads, self._refresh_oled)
         self._stepseq_handler = StepSeqHandler(state_manager, self._leds, self._pads, self._refresh_oled)
         self._play_handler = PlayHandler(state_manager, self._leds, self._pads, self._play_notes_queue,
@@ -3196,11 +3371,12 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
     def _refresh_oled(self):
         label = self._mode_labels.get(self._current_handler, "")
         self._oled.clear()
-        # oled_status() is an optional per-handler hook (currently only
-        # PlayHandler has one, for its scale/tonic - see its own
-        # oled_status()) - a second, smaller status line under the mode
-        # name instead of the single big centered label every other mode
-        # gets.
+        # oled_status() is an optional per-handler hook (every handler has
+        # one now: Mixer/StepSeq's live Volume/Balance/Velocity/etc.
+        # readout, StepSeq/PlayHandler's scale/tonic, Zynpad's Play-mode/
+        # MIDI-channel readout) - a second, smaller status line under the
+        # mode name instead of the single big centered label a handler
+        # with nothing to show (None here) gets.
         get_status = getattr(self._current_handler, "oled_status", None)
         status = get_status() if get_status is not None else None
         if status:
