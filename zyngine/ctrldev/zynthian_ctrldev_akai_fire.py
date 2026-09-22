@@ -1880,9 +1880,13 @@ class StepSeqHandler(ModeHandlerBase):
         self._tonic = 0          # root note (0-11), see _load_keymap()/_paint_pad's tonic-row tint
         self._degree_count = 12  # rows/octave, see _load_keymap()/note_on's Alt+Pattern Up/Down
         self._keymap = [{"note": n} for n in range(128)]
-        self._row_offset = 0    # index into _keymap of the topmost visible row
+        self._row_offset = 0    # index into _keymap of the bottom-most visible row (phys_row 3)
+        # Stable pitch reference _load_keymap() re-anchors the view on
+        # across a scale/tonic change, deliberately independent of
+        # _row_offset itself - see _load_keymap()'s own docstring for why.
+        # None until the first refresh() (a fresh recenter always sets it).
+        self._anchor_note = None
         self._step_page = 0     # which 16-step page of the pattern is visible
-        self._steps = 16        # getSteps() of the current pattern, cached in refresh()
 
         # (step, note) pairs - see class comment. _last_note is the fallback
         # group-edit target when _selected_notes is empty (the most recently
@@ -1909,13 +1913,28 @@ class StepSeqHandler(ModeHandlerBase):
         self._playhead_timer = IntervalTimer()
 
     def set_alt(self, state):
-        # Momentary BTN_ALT, used as a modifier for the Filter knob
-        # (Alt+Filter = play chance instead of stutter count), Grid
-        # Left/Right (Alt+Grid = cycle scale instead of step-paging - see
-        # note_on/_cycle_scale) and Pattern Up/Down (Alt+Pattern = scroll a
-        # full octave's worth of rows instead of 1 - see note_on/
-        # _scroll_rows; Shift+Pattern scrolls a full 4-row page instead).
+        # Momentary BTN_ALT, used as a modifier for Grid Left/Right
+        # (Alt+Grid = cycle scale instead of step-paging - see note_on/
+        # _cycle_scale) and Pattern Up/Down (Alt+Pattern = scroll a full
+        # 4-row page instead of 1 row - see note_on/_scroll_rows;
+        # Shift+Pattern scrolls a full octave's worth of rows instead). The
+        # Filter knob's own Chance modifier uses Shift instead of Alt (see
+        # cc_change) - Alt+touch on any of the 4 channel-strip knobs is a
+        # global "zynpot switch push" gesture, intercepted before dispatch
+        # ever reaches here (see the top-level driver's own midi_event).
         self._is_alt = state
+        self._paint_grid_leds()
+
+    def on_alt_mode_changed(self):
+        """Shift mirrors the persistent alt_mode toggle (see the top-level
+        driver's own _on_alt_mode_changed, the only caller) - pushed here
+        explicitly since self._is_shifted is otherwise only kept in sync
+        inside note_on (via _on_shifted_override), and Grid Left/Right's
+        own idle LED (see _paint_grid_leds) needs to reflect a Shift
+        toggle immediately, not just whenever the next Grid press/release
+        happens to pick up the new value."""
+        self._is_shifted = _alt_mode()
+        self._paint_grid_leds()
 
     # ----------------------------------------------------------------------
     # Keymap / view
@@ -1938,15 +1957,27 @@ class StepSeqHandler(ModeHandlerBase):
         the row view on middle C, same as before. recenter=False
         (_on_scale_changed() - still the same pattern, just its scale/tonic
         changed) instead keeps showing roughly the same pitch range: the
-        note that was at the current row_offset gets relocated in the new
-        keymap (its nearest match, since the exact note may no longer be
-        in-scale) and the view re-anchors there - changing scale would
+        view re-anchors on self._anchor_note (its nearest match, since the
+        exact note may no longer be in-scale) - changing scale would
         otherwise always yank the view back to middle C, losing whatever
-        octave you'd scrolled to."""
-        anchor_note = None
-        if not recenter and self._keymap and 0 <= self._row_offset < len(self._keymap):
-            anchor_note = self._keymap[self._row_offset]["note"]
+        octave you'd scrolled to.
 
+        self._anchor_note is a stable reference pitch, deliberately NOT
+        re-derived from self._row_offset's own (possibly already-rounded)
+        note on every call - only recenter (below) and _scroll_rows() ever
+        write it. Re-deriving it from the current keymap's own nearest-
+        match result each time (the original approach) was a bug found on
+        hardware: nearest-match isn't its own inverse, so a chain of scale
+        changes that returns to an earlier scale (e.g. Major -> Minor ->
+        Major) could still land one row off from a direct Major visit,
+        since the second Major lookup was quantizing against Minor's own
+        already-rounded result instead of the original anchor - drift that
+        compounds with every extra scale hop, not just a simple off-by-one
+        like the one fixed just before this. Anchoring on a note stable
+        across any number of scale hops (only moving when the user
+        actually scrolls) makes any chain back to the same scale land
+        exactly where a direct visit would, regardless of what was visited
+        in between."""
         scale = self._libseq.getScale()
         tonic = self._libseq.getTonic()
         self._tonic = tonic
@@ -1973,11 +2004,25 @@ class StepSeqHandler(ModeHandlerBase):
             keymap = [{"note": n} for n in range(128)]
         self._keymap = keymap
 
-        if recenter or anchor_note is None:
-            idx = next((i for i, e in enumerate(keymap) if e["note"] >= 60), 0)
+        fresh = recenter or self._anchor_note is None
+        if fresh:
+            # -1: land one row below the first note >= middle C, not right
+            # on it - same visual framing as before this method grew the
+            # anchor-based branch below.
+            idx = next((i for i, e in enumerate(keymap) if e["note"] >= 60), 0) - 1
         else:
-            idx = min(range(len(keymap)), key=lambda i: abs(keymap[i]["note"] - anchor_note))
-        self._row_offset = max(0, min(idx - 1, len(keymap) - 4))
+            # No -1 here (unlike above) - idx already IS the row to land
+            # on: self._anchor_note's own new position, not a fresh
+            # "first note >= middle C" search.
+            idx = min(range(len(keymap)), key=lambda i: abs(keymap[i]["note"] - self._anchor_note))
+        self._row_offset = max(0, min(idx, len(keymap) - 4))
+        # Only a fresh recenter moves the anchor itself - _scroll_rows() is
+        # the only other place that does (a deliberate user action) -
+        # never here otherwise, see this method's own docstring for why
+        # re-deriving it from the just-computed row would reintroduce the
+        # drift this design avoids.
+        if fresh:
+            self._anchor_note = keymap[self._row_offset]["note"]
 
     def _cycle_scale(self, delta):
         """Alt+Grid Left/Right - cycles the pattern's Scale param through 0
@@ -2036,18 +2081,77 @@ class StepSeqHandler(ModeHandlerBase):
         return (row, col) if 0 <= row < 4 else None
 
     def _page_steps(self, direction):
-        max_page = max(0, (self._steps - 1) // 16)
+        # getSteps() read fresh, not cached - see refresh()'s own comment on
+        # why this handler stopped caching pattern length at all.
+        max_page = max(0, (self._libseq.getSteps() - 1) // 16)
         self._step_page = max(0, min(self._step_page + direction, max_page))
         self._paint_all()
+        self._paint_grid_leds()
+
+    def _page_headroom(self, delta):
+        """How many more times a plain Grid Left/Right (see note_on) could
+        page that direction before hitting the edge, capped at 2 -
+        _paint_grid_leds only needs to tell off/dull/bright apart, not the
+        exact count. Independent, read-only simulation of _page_steps' own
+        stepping (not shared code, same reasoning as PlayHandler/
+        MixerHandler's own headroom helpers) - a purely-a-LED-query method
+        shouldn't risk perturbing that already-working mutation logic."""
+        max_page = max(0, (self._libseq.getSteps() - 1) // 16)
+        page = self._step_page
+        headroom = 0
+        for _ in range(2):
+            page += delta
+            if not (0 <= page <= max_page):
+                break
+            headroom += 1
+        return headroom
+
+    def _paint_grid_leds(self):
+        """Grid Left/Right's own idle LED state. Unlike Play/Mixer's own
+        equivalent (a single fixed meaning each, see their own
+        _paint_octave_leds/_paint_grid_leds), Grid Left/Right here still
+        means 3 different things depending on modifier (plain = page
+        steps, Alt = cycle scale, Shift = adjust tonic - see note_on) - but
+        only the plain, no-modifier meaning actually has an edge to be
+        boundary-aware about: Scale and Tonic both wrap around
+        (_cycle_scale/_adjust_tonic's own modulo math), so there's never
+        really "no room left" for either - both LEDs just go bright
+        whenever Alt or Shift is currently held, same as the plain
+        "just bound to something" convention everywhere else in this
+        driver uses for a button whose meaning isn't fixed, and only fall
+        back to genuine boundary-awareness (via _page_headroom) for the
+        one sub-meaning that actually has an edge. Called from refresh()
+        (mode entry, pattern reload - the page boundary can change with a
+        different pattern's own step count), _page_steps (after an actual
+        page move), note_off (reverting the press-flash, see note_on's own
+        comment), set_alt (Alt press/release can change which of the 3
+        meanings currently applies) and the top-level driver's own
+        on_alt_mode_changed (Shift/Bank toggle, same reason as Alt)."""
+        if self._is_alt or self._is_shifted:
+            for led in (LED_GRID_LEFT, LED_GRID_RIGHT):
+                self._leds.led_on(led, LED_RED_HIGH)
+            return
+        for led, delta in ((LED_GRID_LEFT, -1), (LED_GRID_RIGHT, 1)):
+            headroom = self._page_headroom(delta)
+            if headroom == 0:
+                self._leds.led_off(led)
+            elif headroom == 1:
+                self._leds.led_on(led, LED_RED_DULL)
+            else:
+                self._leds.led_on(led, LED_RED_HIGH)
 
     def _scroll_rows(self, direction, amount=1):
         """Plain Pattern Up/Down scroll by 1 row; Shift+Pattern Up/Down (see
         note_on) passes amount=4 (a full page - the visible window height);
         Alt+Pattern Up/Down passes amount=self._degree_count (one octave's
         worth of rows - 12 for Chromatic, or however many degrees the
-        active scale has, see _load_keymap)."""
+        active scale has, see _load_keymap). Updates self._anchor_note too
+        - a deliberate scroll is exactly the kind of user action that
+        should move _load_keymap()'s own re-anchor reference for the next
+        scale/tonic change, see its own docstring."""
         max_offset = max(0, len(self._keymap) - 4)
         self._row_offset = max(0, min(self._row_offset + direction * amount, max_offset))
+        self._anchor_note = self._keymap[self._row_offset]["note"]
         self._paint_all()
 
     # ----------------------------------------------------------------------
@@ -2062,14 +2166,30 @@ class StepSeqHandler(ModeHandlerBase):
 
     def refresh(self):
         self._load_keymap()
-        self._steps = self._libseq.getSteps()
+        # Pattern length (getSteps()) is NOT cached (unlike this method's
+        # other resets, which are genuinely one-shot on activation) -
+        # every consumer below reads it fresh instead (_page_steps/
+        # _paint_pad/_on_grid_press/_adjust_duration). A cached copy here
+        # went stale the moment the pattern's own length changed elsewhere
+        # (e.g. extended via the touchscreen) while StepSeq stayed the
+        # active mode with no activation to re-cache it - found on
+        # hardware as Grid Left/Right silently refusing to page a pattern
+        # that had genuinely grown past 16 steps.
         self._step_page = 0
         self._selected_notes = set()
         self._last_note = None
         self._held = {}
         self._playhead_step = None
+        # self._is_shifted is otherwise only kept in sync inside note_on
+        # (via _on_shifted_override) - resynced here too so a fresh
+        # activation's own Grid Left/Right idle LED (_paint_grid_leds)
+        # reflects Shift's actual current state immediately, not whatever
+        # this handler's own copy was last left at (stale, or still the
+        # __init__ default) before any note_on happens to run.
+        self._is_shifted = _alt_mode()
         self._paint_all()
         self._update_leds()
+        self._paint_grid_leds()
 
     def _paint_all(self):
         for row in range(4):
@@ -2104,7 +2224,7 @@ class StepSeqHandler(ModeHandlerBase):
         note_pad = _pad(row, col)
         step = self._step_page * 16 + col
         idx = self._keymap_index(row)
-        if idx is None or step >= self._steps:
+        if idx is None or step >= self._libseq.getSteps():
             self._pads.pad_off(note_pad)
             return
         note_val = self._keymap[idx]["note"]
@@ -2169,7 +2289,7 @@ class StepSeqHandler(ModeHandlerBase):
         row, col = idx // 16, idx % 16
         step = self._step_page * 16 + col
         krow = self._keymap_index(row)
-        if krow is None or step >= self._steps:
+        if krow is None or step >= self._libseq.getSteps():
             return True
         note_val = self._keymap[krow]["note"]
 
@@ -2328,11 +2448,12 @@ class StepSeqHandler(ModeHandlerBase):
 
     def _adjust_duration(self, delta):
         changed = []
+        steps = self._libseq.getSteps()
         for step, note_val in self._current_targets():
             dur = self._libseq.getNoteDuration(step, note_val)
             if dur <= 0:
                 continue
-            dur = max(1, min(self._steps, dur + delta))
+            dur = max(1, min(steps, dur + delta))
             self._set_note_duration(step, note_val, dur)
             changed.append((step, note_val, dur))
         self._paint_all()
@@ -2461,6 +2582,7 @@ class StepSeqHandler(ModeHandlerBase):
 
     # ----------------------------------------------------------------------
     def note_on(self, note, velocity, shifted_override=None):
+        self._on_shifted_override(shifted_override)
         if note in ZYNPOT_KNOBS:
             self._knobs_ease.reset(note)
             return True
@@ -2485,25 +2607,28 @@ class StepSeqHandler(ModeHandlerBase):
             self._toggle_quantize()
             return True
         if note == BTN_GRID_LEFT:
-            # Momentary flash to high-red on press, back to dull red on
-            # release (note_off below) - see _update_mode_leds' own comment
-            # for why these are just "bound"/"not bound", not boundary-aware.
-            self._leds.led_on(LED_GRID_LEFT, LED_RED_HIGH)
             if self._is_alt:
                 self._cycle_scale(-1)
             elif self._is_shifted:
                 self._adjust_tonic(-1)
             else:
                 self._page_steps(-1)
+            # Momentary flash to high-red on press, back to boundary-aware
+            # idle on release (note_off below, see _paint_grid_leds) - has
+            # to come after the action above (page_steps's own success/
+            # no-op repaints via _paint_grid_leds too) rather than before,
+            # or that repaint would immediately overwrite it - same
+            # reasoning as Play/Mixer's own Grid Left/Right flash.
+            self._leds.led_on(note, LED_RED_HIGH)
             return True
         if note == BTN_GRID_RIGHT:
-            self._leds.led_on(LED_GRID_RIGHT, LED_RED_HIGH)
             if self._is_alt:
                 self._cycle_scale(1)
             elif self._is_shifted:
                 self._adjust_tonic(1)
             else:
                 self._page_steps(1)
+            self._leds.led_on(note, LED_RED_HIGH)
             return True
         if note == BTN_PAT_UP:
             self._leds.led_on(LED_PAT_UP, LED_RED_HIGH)
@@ -2532,10 +2657,13 @@ class StepSeqHandler(ModeHandlerBase):
     def note_off(self, note, shifted_override=None):
         if PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64:
             self._on_grid_release(note)
-        elif note == BTN_GRID_LEFT:
-            self._leds.led_on(LED_GRID_LEFT, LED_RED_DULL)
-        elif note == BTN_GRID_RIGHT:
-            self._leds.led_on(LED_GRID_RIGHT, LED_RED_DULL)
+        elif note in (BTN_GRID_LEFT, BTN_GRID_RIGHT):
+            # Revert the press-flash (see note_on) back to the current
+            # idle color (boundary-aware, or bright if Alt/Shift is still
+            # held - see _paint_grid_leds) - not necessarily what it was
+            # before the press, since a successful page move changes the
+            # headroom on both sides.
+            self._paint_grid_leds()
         elif note == BTN_PAT_UP:
             self._leds.led_on(LED_PAT_UP, LED_RED_DULL)
         elif note == BTN_PAT_DOWN:
@@ -2559,7 +2687,13 @@ class StepSeqHandler(ModeHandlerBase):
         elif ccnum == KNOB_PAN:
             self._adjust_duration(delta)
         elif ccnum == KNOB_FILTER:
-            self._adjust_chance(delta) if self._is_alt else self._adjust_stutter_count(delta)
+            # Shift, not Alt (moved - see the plan doc): Alt+touch on any
+            # of the 4 channel-strip knobs is a global "zynpot switch push"
+            # gesture (see midi_event's ZYNPOT_KNOBS handling), intercepted
+            # before dispatch ever reaches here - Alt+Filter's own touch
+            # never reached this handler at all, and releasing it fired an
+            # unrelated CUIA on top. Shift has no such collision.
+            self._adjust_chance(delta) if self._is_shifted else self._adjust_stutter_count(delta)
         elif ccnum == KNOB_RESONANCE:
             self._adjust_stutter_dur(delta)
         return True
@@ -3601,6 +3735,33 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         self._current_handler.refresh()
         self._update_mode_leds()
 
+    def _on_alt_mode_changed(self):
+        """Shift/Bank (both mirror the same persistent alt_mode toggle, see
+        _alt_mode()'s docstring) need Shift's/Bank's own LED updated
+        (_update_mode_leds) plus a repaint for whichever handler's own
+        painting actually depends on alt_mode - MixerHandler's own
+        Volume-vs-Balance bar view (_paint_row/_show_value read _alt_mode()
+        directly) and StepSeqHandler's own Grid Left/Right idle LED (its
+        own self._is_shifted, only otherwise kept in sync inside note_on
+        via _on_shifted_override - needs pushing here too, or its LED
+        would keep showing the pre-toggle state until the next Grid
+        press/release - see StepSeqHandler.on_alt_mode_changed).
+        Deliberately NOT the current handler's own full refresh() (used to
+        be, until a bug found on hardware: StepSeqHandler's own refresh()
+        resets/recenters its whole view - row scroll position, step page,
+        selection, held notes - as a side effect of what should just be a
+        repaint here, so toggling Shift/Bank while StepSeq was active kept
+        silently yanking the pad grid back to its default position).
+        MixerHandler.refresh() has no such side effects (just repaints
+        rows/solo LEDs/OLED, no state reset), safe to call on every toggle
+        - no other handler needs anything here at all (confirmed - none of
+        Zynpad/Play's own painting reads _alt_mode())."""
+        if self._current_handler is self._mixer_handler:
+            self._mixer_handler.refresh()
+        elif self._current_handler is self._stepseq_handler:
+            self._stepseq_handler.on_alt_mode_changed()
+        self._update_mode_leds()
+
     def _update_mode_leds(self):
         # This whole bottom-left cluster (Step/Note/Drum/Perform/Shift, all
         # yellow-red) idles at dull yellow rather than fully off - reads as
@@ -3742,15 +3903,19 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         # touch-flash) is each handler's own note_on/note_off, not here -
         # this only sets the idle baseline. Exceptions: Play mode's own
         # Grid Left/Right (swapped with Select to do octave-shift instead
-        # of chain-switch - see PlayHandler.note_on/cc_change) and Mixer's
-        # own (paging chains left/right - see MixerHandler.note_on) both
-        # have a single fixed meaning with no modifier overloading, so they
-        # CAN be boundary-aware - each of those handlers owns painting
-        # those two itself instead (see PlayHandler._paint_octave_leds/
-        # MixerHandler._paint_grid_leds), skipped here entirely so the two
-        # don't fight over the same LEDs.
-        if self._current_handler not in (self._play_handler, self._mixer_handler):
-            grid_bound = self._current_handler in (self._stepseq_handler, self._zynpad_handler)
+        # of chain-switch - see PlayHandler.note_on/cc_change), Mixer's own
+        # (paging chains left/right - see MixerHandler.note_on) and
+        # StepSeq's own (page steps - see StepSeqHandler.note_on) all have
+        # at least a plain, no-modifier meaning that CAN be boundary-aware
+        # (StepSeq's own Alt/Shift meanings are both cyclic/wrap-around, so
+        # only the plain one has an actual edge - see its own
+        # _paint_grid_leds for how it splits that) - each of those 3
+        # handlers owns painting those two itself instead (see
+        # PlayHandler._paint_octave_leds/MixerHandler._paint_grid_leds/
+        # StepSeqHandler._paint_grid_leds), skipped here entirely so the
+        # two don't fight over the same LEDs.
+        if self._current_handler not in (self._play_handler, self._mixer_handler, self._stepseq_handler):
+            grid_bound = self._current_handler is self._zynpad_handler
             for led in (LED_GRID_LEFT, LED_GRID_RIGHT):
                 self._leds.led_on(led, LED_RED_DULL) if grid_bound else self._leds.led_off(led)
         pattern_bound = self._current_handler in (self._stepseq_handler, self._play_handler, self._zynpad_handler)
@@ -3847,7 +4012,7 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
 
             if note == BTN_SHIFT:
                 # Sticky (toggle), not momentary - see _alt_mode()'s
-                # docstring. self.refresh() updates Shift's own LED
+                # docstring. _on_alt_mode_changed() updates Shift's own LED
                 # (_update_mode_leds) plus whatever the current handler
                 # shows for alt_mode (e.g. Mixer's volume-vs-balance view).
                 # No explicit push into any handler's own _is_shifted
@@ -3856,7 +4021,7 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 # own copy is only ever consulted synchronously within that
                 # same call, never read asynchronously in between presses.
                 _toggle_alt_mode()
-                self.refresh()
+                self._on_alt_mode_changed()
                 return True
             if note == BTN_ALT:
                 self._is_alt = True
@@ -3869,8 +4034,9 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 # Alt+Perform (ZS3) work from any mode, so _is_alt itself is
                 # tracked unconditionally above - but only forward into
                 # MixerHandler (its Alt+Solo-N = toggle solo modifier),
-                # StepSeqHandler (its Alt+Filter = play chance modifier),
-                # ZynpadHandler (its Alt+Solo3/4 = cycle backwards) or
+                # StepSeqHandler (its Alt+Grid = cycle scale, Alt+Pattern =
+                # 4-row page modifiers), ZynpadHandler (its Alt+Solo3/4 =
+                # cycle backwards) or
                 # PlayHandler (its Alt+Select = adjust Tonic) while one of
                 # them is actually the active mode.
                 if self._current_handler is self._mixer_handler:
@@ -3993,8 +4159,11 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             # Transport, Browser and Bank/Mode are global: they work the same
             # regardless of which mode is currently active.
             if note == BTN_BANK:
+                # Same alt_mode toggle as Shift above - see
+                # _on_alt_mode_changed()'s own comment for why this isn't
+                # self.refresh().
                 _toggle_alt_mode()
-                self.refresh()
+                self._on_alt_mode_changed()
                 return True
             if note == BTN_BROWSER:
                 if self._is_alt:
