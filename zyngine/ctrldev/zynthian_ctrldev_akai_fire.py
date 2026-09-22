@@ -288,6 +288,24 @@ def _note_name(note):
     return f"{NOTE_NAMES[note % 12]}{note // 12 - 1}"
 
 
+def _format_volume(level):
+    """level: zynmixer's own 0.0-1.0 linear scale -> "Volume: X.XXdB" (or
+    "-∞dB" at 0). Matches zynthian_gui_mixer's own title-bar readout
+    exactly (same dB formula, same -inf fallback at 0). Module-level since
+    both MixerHandler and PlayHandler's own _show_chain_value (see
+    update_mixer_strip) show this same transient."""
+    if level <= 0:
+        return "Volume: -∞dB"
+    return f"Volume: {20 * math.log10(level):.2f}dB"
+
+
+def _format_balance(balance):
+    """balance: zynmixer's own -1.0..1.0 linear scale -> "Balance: X%".
+    Percent, not dB/L-R - matches zynthian_gui_mixer's own title-bar
+    readout (int(value*100)) other than rounding instead of truncating."""
+    return f"Balance: {round(balance * 100)}%"
+
+
 def _alt_mode():
     """Zynthian's persistent, global "alt mode" toggle (Bank/Mode button /
     TOGGLE_ALT_MODE CUIA, see zyngui/zynthian_gui.py's alt_mode attribute) -
@@ -590,9 +608,11 @@ class KnobJitterFilter:
 # used whenever the active mode has no more specific use for a given knob
 # (its own cc_change/note_on decline by returning falsy) - including
 # whatever screen has no dedicated mode of its own at all, now that
-# DeviceHandler is gone. PlayHandler is the only handler with any bespoke
-# use left for one of these 4 (Volume, repurposed for tonic) - the other 3
-# fall through to this same shared default there too.
+# DeviceHandler is gone. This is also how Volume/Pan/Filter already reach a
+# chain's own level/balance (or Main's, for Filter) while Play mode is
+# active - PlayHandler has no bespoke use for any of these 4, it only
+# listens for the resulting change to show it (see its own
+# update_mixer_strip) rather than handling the knob directly.
 # --------------------------------------------------------------------------
 class ZynpotRotate:
     def __init__(self, state_manager):
@@ -796,49 +816,78 @@ class MixerHandler(ModeHandlerBase):
         active_chain = self._chain_manager.get_active_chain()
         self._active_chain = active_chain.chain_id if active_chain else 0
 
-        # Live Volume/Balance readout (see _show_value/oled_status) while a
-        # knob or bar pad is actually changing one - see TransientOledLine.
+        # Live Volume/Balance readout (see _show_value/oled_status/
+        # oled_label) while a knob or bar pad is actually changing one -
+        # see TransientOledLine.
         self._oled_value = TransientOledLine(oled_refresh_cb)
+        self._oled_value_chain_id = None  # chain_id _show_value() last showed a value for
+        self._oled_refresh_cb = oled_refresh_cb  # see refresh()/_instrument_label()
 
     def refresh(self):
         for pos in range(4):
             self._paint_solo_led(pos)
             self._paint_row(pos)
+        self._paint_grid_leds()
+        # Keeps the OLED's own instrument-name fallback (see
+        # _instrument_label()/oled_status()) in sync whenever the active
+        # chain changes - refresh() already runs on every path that can
+        # change it (Solo-N press, Select-knob scroll via the active-chain
+        # signal round-trip, mode switch into Mixer).
+        if self._oled_refresh_cb:
+            self._oled_refresh_cb()
 
-    def _show_value(self, chain):
+    def _show_value(self, chain, is_balance):
         """Called after a knob turn or bar-pad tap actually changes
         Volume/Balance (see cc_change/_on_bar_pad) - shows the new value on
-        the OLED (see oled_status()) for a couple seconds. _alt_mode()
-        decides which one to read back, same as _paint_row uses it to
-        decide which one to paint."""
-        if _alt_mode():
-            self._oled_value.show(self._format_balance(self._zynmixer.get_balance(chain.mixer_chan)))
+        the OLED (see oled_status()) for a couple seconds. is_balance says
+        which one was actually just touched - NOT the same thing as
+        _alt_mode(): the bar pads are genuinely dual-mode (_paint_row/
+        _on_bar_pad use _alt_mode() to decide which one the same 16 pads
+        edit, so callers there correctly pass _alt_mode() through), but
+        the Volume/Pan knobs are two independent, fixed-purpose controls -
+        Pan always edits Balance and Volume always edits Level regardless
+        of alt_mode, so cc_change's own two branches pass a fixed True/
+        False instead. Reading _alt_mode() here unconditionally (the
+        original bug) made every *knob* edit show whichever of the two
+        alt_mode happened to select, ignoring which knob was actually
+        turned."""
+        self._oled_value_chain_id = chain.chain_id
+        if is_balance:
+            self._oled_value.show(_format_balance(self._zynmixer.get_balance(chain.mixer_chan)))
         else:
-            self._oled_value.show(self._format_volume(self._zynmixer.get_level(chain.mixer_chan)))
+            self._oled_value.show(_format_volume(self._zynmixer.get_level(chain.mixer_chan)))
 
-    @staticmethod
-    def _format_volume(level):
-        """level: zynmixer's own 0.0-1.0 linear scale. Matches
-        zynthian_gui_mixer's own title-bar readout exactly (same dB
-        formula, same -inf fallback at 0)."""
-        if level <= 0:
-            return "Volume: -∞dB"
-        return f"Volume: {20 * math.log10(level):.2f}dB"
-
-    @staticmethod
-    def _format_balance(balance):
-        """balance: zynmixer's own -1.0..1.0 linear scale. Percent, not
-        dB/L-R - matches zynthian_gui_mixer's own title-bar readout
-        (int(value*100)) other than rounding instead of truncating."""
-        return f"Balance: {round(balance * 100)}%"
+    def oled_label(self):
+        """Overrides the top-level driver's own fixed "Mixer" label (see
+        _refresh_oled) with the transient Volume/Balance value itself
+        while one is showing (see _show_value) - promoted here from the
+        status row below so the transient gets the whole screen: value on
+        top, the chain it actually belongs to underneath (see
+        oled_status()) - NOT necessarily the active chain, since a bar-pad
+        tap can edit a different row's chain without switching to it."""
+        return self._oled_value.text
 
     def oled_status(self):
         """Secondary OLED line while Mixer is active (see the top-level
-        driver's _refresh_oled) - only the transient Volume/Balance
-        readout from _show_value() above; None (falls back to the plain
-        centered "Mixer" label) once that's timed out, same as every mode
-        with nothing to show."""
-        return self._oled_value.text
+        driver's _refresh_oled) - the name of the chain a showing
+        Volume/Balance transient actually belongs to (see _show_value/
+        oled_label(), tracked separately from the active chain - see its
+        own comment) takes priority for a couple seconds after a knob/pad
+        edit; otherwise the active chain's own instrument name (see
+        _instrument_label()), or None (falls back to the plain centered
+        "Mixer" label) if there's no active chain."""
+        if self._oled_value.text:
+            chain = self._chain_manager.get_chain(self._oled_value_chain_id)
+            return chain.get_description(1) if chain is not None else None
+        return self._instrument_label()
+
+    def _instrument_label(self):
+        """The active chain's own instrument name - same
+        chain.get_description(1) call zynthian_gui_mixer.py's own
+        title-bar readout already uses next to Volume (engine/processor
+        name only, no preset - get_description_parts()'s own first part)."""
+        chain = self._chain_manager.get_chain(self._active_chain)
+        return chain.get_description(1) if chain is not None else None
 
     def _regular_chain_ids(self):
         """Ordered chain IDs excluding Main (chain_id 0). Main's own slot in
@@ -864,6 +913,59 @@ class MixerHandler(ModeHandlerBase):
         if index >= len(ids):
             return None
         return self._chain_manager.get_chain(ids[index])
+
+    def _page_headroom(self, delta):
+        """How many more times Grid Left/Right (see note_on) could page
+        that direction before hitting the edge, capped at 2 -
+        _paint_grid_leds only needs to tell off/dull/bright apart, not the
+        exact count. Independent, read-only simulation of note_on's own
+        Grid Left/Right stepping (not shared code, same reasoning as
+        PlayHandler's own _octave_headroom) - a purely-a-LED-query method
+        shouldn't risk perturbing that already-working mutation logic."""
+        bank = self._chains_bank
+        on_master = self._on_master_page
+        max_bank = self._max_bank()
+        headroom = 0
+        for _ in range(2):
+            if delta < 0:
+                if on_master:
+                    on_master = False
+                elif bank > 0:
+                    bank -= 1
+                else:
+                    break
+            else:
+                if on_master:
+                    break
+                elif bank < max_bank:
+                    bank += 1
+                else:
+                    on_master = True
+            headroom += 1
+        return headroom
+
+    def _paint_grid_leds(self):
+        """Grid Left/Right's own idle LED state - boundary-aware via
+        _page_headroom, same idea (and same reasoning: a single fixed
+        meaning here, no modifier overloading, unlike every other mode's
+        shared/overloaded use of these 2 buttons - see the top-level
+        driver's own _update_mode_leds, which skips painting these two
+        while Mixer is active and defers to this method instead) as
+        PlayHandler's own _paint_octave_leds: off = can't page that way at
+        all, dull red = exactly one more page before the edge, high red =
+        more room than that. Called from refresh() (mode entry, chain
+        added/removed, page change - including a page actually moving, via
+        note_on's own refresh() call) and again from note_off, to revert
+        the press-flash note_on adds on top (see its own comment) back to
+        the current idle color."""
+        for led, delta in ((LED_GRID_LEFT, -1), (LED_GRID_RIGHT, 1)):
+            headroom = self._page_headroom(delta)
+            if headroom == 0:
+                self._leds.led_off(led)
+            elif headroom == 1:
+                self._leds.led_on(led, LED_RED_DULL)
+            else:
+                self._leds.led_on(led, LED_RED_HIGH)
 
     def _paint_solo_led(self, pos):
         """Both of Solo N's independent lights (see the "Solo 1-4 have two
@@ -977,7 +1079,7 @@ class MixerHandler(ModeHandlerBase):
                 self._zynmixer.set_balance(chain.mixer_chan, 0)
                 self._last_tapped_col[pos] = None
                 self._paint_row(pos)
-                self._show_value(chain)
+                self._show_value(chain, is_balance=True)
                 return True
 
         # Tapping the same physical pad as last time on this row = fine
@@ -1016,7 +1118,7 @@ class MixerHandler(ModeHandlerBase):
             self._zynmixer.set_level(chain.mixer_chan, self._volume_from_fine_pos(fine_pos) / 100)
 
         self._paint_row(pos)
-        self._show_value(chain)
+        self._show_value(chain, is_balance=_alt_mode())
         return True
 
     def _off_bar_pad(self, note):
@@ -1036,7 +1138,10 @@ class MixerHandler(ModeHandlerBase):
 
         # Touch just resets this knob's own easing accumulator (Volume/Pan
         # only - Filter/Resonance aren't used in Mixer mode, so they decline
-        # and fall to the top-level driver's own shared default instead).
+        # and fall to the top-level driver's own shared default instead -
+        # which, for Filter, already reaches the real Mixer screen's own
+        # "SNAPSHOT encoder adjusts main mixbus level" zynpot handling, see
+        # update_mixer_strip below).
         if note in (KNOB_VOLUME, KNOB_PAN):
             self._knobs_ease.reset(note)
             return True
@@ -1062,10 +1167,6 @@ class MixerHandler(ModeHandlerBase):
             return True
 
         if note == BTN_GRID_LEFT:
-            # Momentary flash to high-red on press, back to dull red on
-            # release (note_off below) - see _update_mode_leds' own comment
-            # for why these are just "bound"/"not bound", not boundary-aware.
-            self._leds.led_on(LED_GRID_LEFT, LED_RED_HIGH)
             # Master page (see _chain_at()) sits one step past the last
             # regular page - Grid Left/Right walk in and out of it too.
             if self._on_master_page:
@@ -1073,10 +1174,19 @@ class MixerHandler(ModeHandlerBase):
             else:
                 self._chains_bank = max(0, self._chains_bank - 1)
             self.refresh()
+            # Momentary flash to high-red on press (note == LED_GRID_LEFT/
+            # RIGHT - same value, see their own definitions), back to
+            # boundary-aware idle on release (note_off below) - has to come
+            # after refresh() above (which already repaints via
+            # _paint_grid_leds on every call, success or not) rather than
+            # before, or the repaint would immediately overwrite it.
+            # Flashes regardless of whether paging actually moved (e.g.
+            # already at the edge) - still real tactile feedback that the
+            # press registered.
+            self._leds.led_on(note, LED_RED_HIGH)
             return True
 
         if note == BTN_GRID_RIGHT:
-            self._leds.led_on(LED_GRID_RIGHT, LED_RED_HIGH)
             if self._on_master_page:
                 pass
             elif self._chains_bank >= self._max_bank():
@@ -1084,6 +1194,7 @@ class MixerHandler(ModeHandlerBase):
             else:
                 self._chains_bank += 1
             self.refresh()
+            self._leds.led_on(note, LED_RED_HIGH)
             return True
 
         # No specific use for Select's own push here - declines to the
@@ -1093,10 +1204,12 @@ class MixerHandler(ModeHandlerBase):
     def note_off(self, note, shifted_override=None):
         if PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64:
             self._off_bar_pad(note)
-        elif note == BTN_GRID_LEFT:
-            self._leds.led_on(LED_GRID_LEFT, LED_RED_DULL)
-        elif note == BTN_GRID_RIGHT:
-            self._leds.led_on(LED_GRID_RIGHT, LED_RED_DULL)
+        elif note in (BTN_GRID_LEFT, BTN_GRID_RIGHT):
+            # Revert the press-flash (see note_on) back to the current
+            # boundary-aware idle color - NOT necessarily what it was
+            # before the press, since paging (if it moved) may have
+            # changed the headroom on either side.
+            self._paint_grid_leds()
 
     def cc_change(self, ccnum, ccval):
         # Select's own encoder isn't noisy like the other 4 - use it raw.
@@ -1121,7 +1234,7 @@ class MixerHandler(ModeHandlerBase):
             value = max(0, min(value + delta, 100))
             self._zynmixer.set_level(chain.mixer_chan, value / 100)
             self._paint_active_row()
-            self._show_value(chain)
+            self._show_value(chain, is_balance=False)
             return True
 
         if ccnum == KNOB_PAN:
@@ -1129,7 +1242,7 @@ class MixerHandler(ModeHandlerBase):
             value = max(-100, min(value + delta, 100))
             self._zynmixer.set_balance(chain.mixer_chan, value / 100)
             self._paint_active_row()
-            self._show_value(chain)
+            self._show_value(chain, is_balance=True)
             return True
 
     def _pos_of_chain_id(self, chain_id):
@@ -1162,6 +1275,19 @@ class MixerHandler(ModeHandlerBase):
         chain_id = self._chain_manager.get_chain_id_by_mixer_chan(chan)
         if chain_id is None:
             return
+        # Main/Master's own level (3rd knob - Filter still just declines
+        # here and falls to the shared default, which already reaches the
+        # real Mixer screen's own "SNAPSHOT encoder adjusts main mixbus
+        # level" zynpot handling, see note_on's own comment) has no bespoke
+        # UI of its own to keep fresh - only the OLED transient, shown
+        # reactively here rather than re-deriving/re-applying the value
+        # ourselves. Checked before the pos_of_chain_id bail below since
+        # Main's own row is only ever visible on its own dedicated Master
+        # page - the transient should still show regardless.
+        if symbol == "level" and chain_id == 0:
+            chain = self._chain_manager.get_chain(0)
+            if chain is not None:
+                self._show_value(chain, is_balance=False)
         pos = self._pos_of_chain_id(chain_id)
         if pos is None:
             return
@@ -2080,6 +2206,45 @@ class StepSeqHandler(ModeHandlerBase):
         # presses, so "extend to this pad" reads as "cover this step too".
         self._set_note_duration(lo, note_val, hi - lo + 1)
         self._paint_all()
+        self._preview_note(lo, note_val)
+
+    def _step_duration_ms(self):
+        """ms per pattern step at the current tempo/steps-per-beat - same
+        formula the APC key25 mk2 driver's own NotePlayer._get_step_duration
+        uses, for the same purpose (a note's own Duration field is in
+        steps, playNote()'s own duration param is ms)."""
+        spb = self._libseq.getStepsPerBeat()
+        bpm = self._libseq.getTempo()
+        return 60 / (spb * bpm) * 1000
+
+    def _preview_note(self, step, note_val):
+        """Audition: play this cell's note through the same real playback
+        path an actually-playing pattern uses (libseq.playNote() -
+        zynseq:output -> ZynMidiRouter:step_in), so adding/editing a note
+        is immediately audible - same idea, and the same libseq call, as
+        the APC key25 mk2 driver's own StepSeq mode (_play_step) - though
+        simplified to a single self-scheduled note-on/off (playNote()'s
+        own duration param, ms, spawns its own note-off timer in C++, no
+        Python-side timer needed) rather than that driver's full
+        NotePlayer stutter-repeat scheduler - stutter doesn't get
+        simulated during preview, just the plain note.
+
+        Deliberately silent while the pattern is actually playing (state
+        != SEQ_STOPPED, matching _play_step's own gate exactly) - otherwise
+        every add/edit would double the note against the real playback."""
+        seq = self._get_selected_sequence()
+        if seq is None:
+            return
+        bank = self._zynseq.bank
+        if self._libseq.getPlayState(bank, seq) != zynseq.SEQ_STOPPED:
+            return
+        velocity = self._libseq.getNoteVelocity(step, note_val)
+        if velocity <= 0:
+            return
+        duration = self._libseq.getNoteDuration(step, note_val)
+        duration_ms = max(1, min(60000, round(self._step_duration_ms() * duration)))
+        channel = self._libseq.getChannel(bank, seq, 0)
+        self._libseq.playNote(note_val, velocity, channel, duration_ms)
 
     def _toggle_note(self, step, note_val):
         start = self._libseq.getNoteStart(step, note_val)
@@ -2093,6 +2258,7 @@ class StepSeqHandler(ModeHandlerBase):
             self._libseq.addNote(step, note_val, self.DEFAULT_VELOCITY, self.DEFAULT_DURATION, 0)
             self._last_note = (step, note_val)
             self._paint_pad_at(step, note_val)
+            self._preview_note(step, note_val)
 
     def _toggle_selection(self, step, note_val):
         start = self._libseq.getNoteStart(step, note_val)
@@ -2135,6 +2301,18 @@ class StepSeqHandler(ModeHandlerBase):
             text += f" (×{len(by_key)})"
         self._oled_value.show(text)
 
+    def _preview_changed(self, changed):
+        """Audition every note an _adjust_* call actually touched (see
+        _preview_note) - all of them, not just _show_edit's own single
+        representative one: they all just had the same property changed,
+        so previewing only one of several would be a strange partial
+        preview. Skipped for Chance/Pitch (see _adjust_chance/
+        _adjust_pitch) - matching the APC key25 mk2 driver's own 4-knob
+        scope (Duration/Velocity/Stutter count/Stutter dur only) for this
+        first pass."""
+        for step, note_val, _ in changed:
+            self._preview_note(step, note_val)
+
     def _adjust_velocity(self, delta):
         changed = []
         for step, note_val in self._current_targets():
@@ -2146,6 +2324,7 @@ class StepSeqHandler(ModeHandlerBase):
             changed.append((step, note_val, vel))
         self._paint_all()
         self._show_edit("Velocity", "{}", changed)
+        self._preview_changed(changed)
 
     def _adjust_duration(self, delta):
         changed = []
@@ -2158,6 +2337,7 @@ class StepSeqHandler(ModeHandlerBase):
             changed.append((step, note_val, dur))
         self._paint_all()
         self._show_edit("Duration", "{} steps", changed)
+        self._preview_changed(changed)
 
     def _adjust_stutter_count(self, delta):
         changed = []
@@ -2168,6 +2348,7 @@ class StepSeqHandler(ModeHandlerBase):
             self._libseq.setStutterCount(step, note_val, val)
             changed.append((step, note_val, val))
         self._show_edit("Stutter", "{}", changed)
+        self._preview_changed(changed)
 
     def _adjust_stutter_dur(self, delta):
         changed = []
@@ -2178,6 +2359,7 @@ class StepSeqHandler(ModeHandlerBase):
             self._libseq.setStutterDur(step, note_val, val)
             changed.append((step, note_val, val))
         self._show_edit("Stutter dur", "{}", changed)
+        self._preview_changed(changed)
 
     def _adjust_chance(self, delta):
         changed = []
@@ -2397,18 +2579,27 @@ class StepSeqHandler(ModeHandlerBase):
 # to do something when Play mode is already up, where before it did
 # nothing) - see toggle_layout(). Chromatic (the default on every fresh
 # activation): the whole grid is one contiguous run through either every
-# semitone, or - if a scale is selected, see BTN_PAT_UP/DOWN/KNOB_VOLUME
+# semitone, or - if a scale is selected, see BTN_PAT_UP/DOWN/Alt+Select
 # below - every in-scale note only, in ascending pitch order; either way
-# Select still shifts by a full octave. Piano: two independent 2-octave-apart
-# "bands" (rows 0-1 = higher, rows 2-3 = lower), each a real
+# Grid Left/Right still shifts by a full octave. Piano: two independent
+# 2-octave-apart "bands" (rows 0-1 = higher, rows 2-3 = lower), each a real
 # white-key-row/black-key-row piano layout (DrivenByMoss's actual Piano
 # View), deliberately NOT scale-constrained even if one is selected - a
 # scale never removes/moves any of Piano's actual piano keys, since that's
 # the whole point of it being a literal keyboard layout (unlike Chromatic,
 # which has no such fixed physical meaning to preserve). Both layouts
-# octave-shift via the same Select knob. Pressing a pad plays that note on
-# the currently active chain for as long as it's held, at the velocity the
-# pad itself reports.
+# octave-shift via the same Grid Left/Right buttons (boundary-aware LEDs,
+# see _paint_octave_leds) - Select switches which chain you're playing
+# into instead, same idea as Mixer's own Select knob (see _switch_chain).
+# Pressing a pad plays that note on the currently active chain for as long
+# as it's held, at the velocity the pad itself reports. Volume/Pan/Filter
+# have no bespoke handling here either (like Resonance) - they already
+# reach the active chain's own level/balance (Volume/Pan) or Main's own
+# level (Filter) via the shared default's own ZYNPOT->CUIA path, same as
+# Mixer's own knobs/the real Mixer screen itself. update_mixer_strip below
+# only reacts to the resulting change to show the same transient OLED
+# readout Mixer's own knobs use (see oled_label()/oled_status()) - not a
+# from-scratch reimplementation.
 #
 # Scale/tonic (Chromatic layout only, see _midi_note/_apply_scale): BTN_PAT_UP/
 # DOWN cycle through scales.json's entries (same file, and the same 1-based
@@ -2416,11 +2607,11 @@ class StepSeqHandler(ModeHandlerBase):
 # editor's own per-pattern Scale param - see zynthian_gui_patterneditor.py's
 # load_keymap - though this is otherwise entirely independent state: Play
 # mode's scale has nothing to do with whatever's set for a specific
-# pattern), wrapping back to index 0 = Chromatic (no filter). The Volume
-# knob (repurposed here, like StepSeq repurposes all 4 knobs for its own
-# note-editing - see its own cc_change) adjusts the tonic. The OLED's second
-# line (see oled_status()) shows the current selection, e.g. "C Major", or
-# "Chromatic" - also the piece originally motivating adding the OLED at all.
+# pattern), wrapping back to index 0 = Chromatic (no filter). Alt+Select
+# adjusts the tonic (see cc_change/_adjust_tonic). The OLED's own label row
+# (see oled_label()) shows the current selection, e.g. "C Major", or
+# "Chromatic", in place of the fixed "Keys" label Piano layout shows there
+# instead - also the piece originally motivating adding the OLED at all.
 #
 # Getting a live note to actually reach an engine turned out to need real
 # JACK-level MIDI I/O, not any Python/ctypes call - see the driver's own
@@ -2465,7 +2656,7 @@ class PlayHandler(ModeHandlerBase):
 
     BASE_NOTE_DEFAULT = 36   # matches DrivenByMoss PianoView's own default
     TOTAL_NOTES = 64         # 4 rows x 16 cols
-    MAX_OCTAVE_STEPS = 5     # Select shifts by a full octave (12 semitones)
+    MAX_OCTAVE_STEPS = 5     # Grid Left/Right shift by a full octave (12 semitones)
                               # per tick, capped at +-5 steps from the default
                               # - refuses (no-op) past that rather than
                               # clamping to a partial, sub-octave shift, which
@@ -2510,10 +2701,42 @@ class PlayHandler(ModeHandlerBase):
         self._pads = pads
         self._notes_queue = notes_queue  # drained by the driver's midiproc_task
         self._oled_refresh_cb = oled_refresh_cb  # top-level driver's _refresh_oled, see _on_scale_changed
-        self._knobs_ease = KnobJitterFilter()  # Volume knob only - see cc_change/_adjust_tonic
+        # Live octave-shift/Volume/Balance/Main-volume readout (see
+        # _shift_base_note/_shift_keymap_offset/update_mixer_strip/
+        # oled_label/oled_status) while Grid Left/Right shifts the octave,
+        # or Volume/Pan/Filter (knobs 1-3) actually change one - shown the
+        # same way Mixer's own Volume/Balance is, see TransientOledLine.
+        # Volume/Pan/Filter are NOT hand-implemented here the way Mixer's
+        # own are - they already reach the right chain via the shared
+        # default's own ZYNPOT->CUIA path (same as any screen with no
+        # bespoke use for a given knob - Filter in particular already
+        # reaches the real Mixer screen's own "SNAPSHOT encoder adjusts
+        # main mixbus level" handling regardless of which Fire mode is
+        # current), so re-deriving/re-applying the value ourselves would
+        # just be redundant - update_mixer_strip below only reacts to the
+        # resulting change to show it. _oled_value_chain_id is which chain
+        # a showing value actually belongs to (the active chain for
+        # Volume/Pan, Main - chain_id 0 - for Filter, see
+        # update_mixer_strip; None for the octave-shift readout, which
+        # isn't chain-specific, see oled_status()).
+        self._oled_value = TransientOledLine(oled_refresh_cb)
+        self._oled_value_chain_id = None
+        # Momentary BTN_ALT, used as a modifier for Select's own dual use
+        # (plain = switch chain, Alt+ = adjust Tonic - see cc_change).
+        # Forwarded from the top-level driver's BTN_ALT handling only
+        # while this handler is actually active (see
+        # midi_event/_set_current_handler), same pattern
+        # Mixer/StepSeq/ZynpadHandler's own set_alt() already use.
+        self._is_alt = False
         self._base_note = self.BASE_NOTE_DEFAULT
         self._octave_step = 0   # -MAX_OCTAVE_STEPS..+MAX_OCTAVE_STEPS, see _shift_octave
         self._chromatic = True  # False = Piano layout, see toggle_layout()
+        # Grid Left/Right (see note_on) can repeat-fire Note On while
+        # physically held - the same real-hardware quirk confirmed
+        # elsewhere in this driver (e.g. ZynpadHandler's own
+        # _held_buttons) - not idempotent here (each firing shifts the
+        # octave once more), unlike its old chain-switch meaning.
+        self._held_grid = set()
 
         # Scale/tonic - Chromatic layout only, see the class comment and
         # _apply_scale(). Deliberately NOT reset in set_active() like
@@ -2549,6 +2772,16 @@ class PlayHandler(ModeHandlerBase):
             # leaving this mode with pads still held would otherwise leave
             # them stuck on forever.
             self._all_notes_off()
+            # Same idea for Grid Left/Right's own held-tracking (see
+            # _held_grid's comment in __init__) - leaving Play mode with
+            # one physically still held would otherwise leave it looking
+            # "still held" forever (note_off never reaches this handler
+            # once it's no longer current), silently ignoring that
+            # button's very next press once Play is re-entered.
+            self._held_grid.clear()
+
+    def set_alt(self, state):
+        self._is_alt = state
 
     def toggle_layout(self):
         """BTN_NOTE pressed again while Play mode is already active (see
@@ -2610,6 +2843,7 @@ class PlayHandler(ModeHandlerBase):
             for col in range(16):
                 self._paint_pad(row, col)
         self._update_leds()
+        self._paint_octave_leds()
 
     def _paint_pad(self, row, col, pressed=False):
         note_pad = _pad(row, col)
@@ -2632,12 +2866,73 @@ class PlayHandler(ModeHandlerBase):
             color = self.COLOR_NOTE
         self._pads.set_pad(note_pad, *color)
 
+    def oled_label(self):
+        """Overrides the top-level driver's own fixed mode-name label (see
+        _refresh_oled). A showing Octave/Volume/Balance/Main-volume
+        transient (see _show_octave/_show_chain_value, the latter driven
+        reactively by update_mixer_strip) takes priority, same as Mixer's
+        own oled_label() - promoted here from the status row below so it
+        gets the whole screen: value on top, the chain it belongs to (or
+        the active chain's, for Octave) underneath, see oled_status().
+        Otherwise the current scale/tonic in Chromatic (e.g. 'C Major', or
+        plain 'Chromatic') - always available (self._scale_label defaults
+        to 'Chromatic', never blank). Piano ignores scale/tonic entirely
+        (see the class comment) - falls all the way through to None there,
+        so the top-level driver falls back to its own fixed 'Keys' label."""
+        return self._oled_value.text or (self._scale_label if self._chromatic else None)
+
     def oled_status(self):
         """Secondary OLED line while Play mode is active (see the top-level
-        driver's _refresh_oled) - current scale/tonic, e.g. 'C Major', or
-        'Chromatic'. None in Piano layout: it has no scale line to show
-        since it ignores scale/tonic entirely (see the class comment)."""
-        return self._scale_label if self._chromatic else None
+        driver's _refresh_oled), layered same as Mixer: while a
+        chain-specific transient is showing (self._oled_value_chain_id, set
+        by update_mixer_strip via _show_chain_value - see oled_label()),
+        the name of the chain it actually belongs to; otherwise (including
+        the Octave transient, which isn't chain-specific -
+        _oled_value_chain_id is None then, see _show_octave) the active
+        chain's own instrument name (see _instrument_label()) - same
+        fallback role Mixer's own oled_status() gives it, so Play mode's
+        OLED reads the same shape (label row + chain-name row) in both
+        Chromatic and Piano, not just Piano, and never blank (a blank
+        status row falls back to _refresh_oled's single-big-centered-label
+        layout instead, which isn't wide enough for a long transient like
+        the Octave one)."""
+        if self._oled_value.text and self._oled_value_chain_id is not None:
+            chain = self._chain_manager.get_chain(self._oled_value_chain_id)
+            return chain.get_description(1) if chain is not None else self._instrument_label()
+        return self._instrument_label()
+
+    def _instrument_label(self):
+        """The active chain's own instrument name - same
+        chain.get_description(1) call zynthian_gui_mixer.py's own
+        title-bar readout already uses next to Volume (engine/processor
+        name only, no preset)."""
+        chain = self._chain_manager.get_active_chain()
+        return chain.get_description(1) if chain is not None else None
+
+    def update_mixer_strip(self, chan, symbol, value):
+        """Volume/Pan/Filter (knobs 1-3, see note_on/the class comment)
+        already reach the right chain's own level/balance (Volume/Pan, the
+        active chain) or Main's own level (Filter) via the shared
+        default's own ZYNPOT->CUIA path - this only adds the missing OLED
+        feedback, reacting to the resulting change via the same global
+        mixer-strip-changed signal MixerHandler's own update_mixer_strip
+        listens to (see the top-level driver's own forwarding), rather
+        than re-deriving/re-applying the value ourselves. Only level/
+        balance matter here (unlike MixerHandler's own version) - no
+        mute/solo LEDs of our own to keep in sync."""
+        if symbol not in ("level", "balance"):
+            return
+        chain_id = self._chain_manager.get_chain_id_by_mixer_chan(chan)
+        if chain_id is None:
+            return
+        chain = self._chain_manager.get_chain(chain_id)
+        if chain is None:
+            return
+        active_chain = self._chain_manager.get_active_chain()
+        if active_chain is not None and chain_id == active_chain.chain_id:
+            self._show_chain_value(chain, is_balance=(symbol == "balance"))
+        elif chain_id == 0 and symbol == "level":
+            self._show_chain_value(chain, is_balance=False)
 
     def _update_leds(self):
         # Solo2/3 (mute/solo) match MixerHandler's own red/mute vs
@@ -2679,7 +2974,7 @@ class PlayHandler(ModeHandlerBase):
         self._held = {}
 
     def _shift_octave(self, delta):
-        """Select knob, both layouts. Piano always shifts self._base_note
+        """Grid Left/Right, both layouts. Piano always shifts self._base_note
         (_piano_note has no notion of _scale_keymap/_keymap_offset at all -
         it's deliberately scale-blind, see the class comment) - only
         Chromatic, and only when a scale is actually active there, shifts
@@ -2714,6 +3009,7 @@ class PlayHandler(ModeHandlerBase):
         self._octave_step = new_step
         self._base_note = new_base
         self.refresh()
+        self._show_octave(new_base)
 
     def _piano_offset_range(self):
         """(min, max) note offset _piano_note can ever produce relative to
@@ -2745,6 +3041,87 @@ class PlayHandler(ModeHandlerBase):
         self._all_notes_off()
         self._keymap_offset = new_offset
         self.refresh()
+        self._show_octave(self._scale_keymap[new_offset])
+
+    def _show_octave(self, note):
+        """Shared by _shift_base_note/_shift_keymap_offset - shows the
+        resulting lowest-reachable note (bottom-left pad) on the OLED the
+        same way Mixer's Volume/Balance shows, since the two paths track
+        fundamentally different underlying state (a flat semitone step
+        count vs an index into a scale-filtered keymap) with no common
+        "octave number" between them - the resulting note is the one thing
+        both can express the same way. Not chain-specific (unlike
+        _show_chain_value's own values) - see oled_status()."""
+        self._oled_value_chain_id = None
+        self._oled_value.show(f"Octave: {_note_name(note)}")
+
+    def _show_chain_value(self, chain, is_balance):
+        """Shared by update_mixer_strip's own two branches - same idea, and
+        same reasoning for taking an explicit is_balance rather than
+        inferring it, as MixerHandler's own _show_value."""
+        self._oled_value_chain_id = chain.chain_id
+        if is_balance:
+            self._oled_value.show(_format_balance(self._zynmixer.get_balance(chain.mixer_chan)))
+        else:
+            self._oled_value.show(_format_volume(self._zynmixer.get_level(chain.mixer_chan)))
+
+    def _octave_headroom(self, delta):
+        """How many more times Grid Left/Right (see note_on) could shift
+        the octave that direction before hitting the edge, capped at 2 -
+        _paint_octave_leds only needs to tell off/dull/bright apart ("no
+        room" / "one more, then that's it" / "still room"), not the exact
+        count. Independent, read-only simulation of
+        _shift_base_note/_shift_keymap_offset's own bounds checks, kept
+        separate (not shared code) so this purely-a-LED-query method can't
+        accidentally perturb their own already-working mutation logic."""
+        scale_mode = self._chromatic and self._scale_keymap is not None
+        if scale_mode:
+            step_size = self._scale_degree_count if delta > 0 else -self._scale_degree_count
+            offset = self._keymap_offset
+        else:
+            step = 1 if delta > 0 else -1
+            octave_step = self._octave_step
+            lo_off, hi_off = (0, self.TOTAL_NOTES - 1) if self._chromatic else self._piano_offset_range()
+
+        headroom = 0
+        for _ in range(2):
+            if scale_mode:
+                offset += step_size
+                if not (0 <= offset < len(self._scale_keymap)):
+                    break
+            else:
+                octave_step += step
+                if not (-self.MAX_OCTAVE_STEPS <= octave_step <= self.MAX_OCTAVE_STEPS):
+                    break
+                new_base = self.BASE_NOTE_DEFAULT + octave_step * 12
+                if not (0 <= new_base + lo_off and new_base + hi_off <= 127):
+                    break
+            headroom += 1
+        return headroom
+
+    def _paint_octave_leds(self):
+        """Grid Left/Right's own idle LED state while Play mode is active
+        (swapped with Select - these shift the octave here, see cc_change/
+        note_on) - 3-tier via _octave_headroom, unlike every other mode's
+        shared/modifier-overloaded use of these same 2 buttons (generic
+        "bound to something", see the top-level driver's own
+        _update_mode_leds, which skips painting these two while Play is
+        active and defers to this method instead): off = can't shift that
+        way at all, dull red = exactly one more shift before the edge,
+        high red = more room than that. Called from refresh() (mode entry,
+        layout toggle, scale cycle - anything that could change what's
+        reachable, including a successful shift attempt, via
+        _shift_base_note/_shift_keymap_offset's own refresh() call) and
+        again from note_off, to revert the press-flash note_on adds on top
+        (see its own comment) back to the current idle color."""
+        for led, delta in ((LED_GRID_LEFT, -1), (LED_GRID_RIGHT, 1)):
+            headroom = self._octave_headroom(delta)
+            if headroom == 0:
+                self._leds.led_off(led)
+            elif headroom == 1:
+                self._leds.led_on(led, LED_RED_DULL)
+            else:
+                self._leds.led_on(led, LED_RED_HIGH)
 
     def _load_scales_json(self):
         try:
@@ -2763,10 +3140,10 @@ class PlayHandler(ModeHandlerBase):
         self._on_scale_changed()
 
     def _adjust_tonic(self, delta):
-        """Volume knob (repurposed here, see the class comment) - only
-        rebuilds/repaints when a scale is actually active; harmless to keep
-        tracking self._tonic even in Chromatic-no-scale/Piano so it's
-        already right if/when a scale gets picked later."""
+        """Alt+Select knob (see cc_change) - only rebuilds/repaints when a
+        scale is actually active; harmless to keep tracking self._tonic even
+        in Chromatic-no-scale/Piano so it's already right if/when a scale
+        gets picked later."""
         self._tonic = (self._tonic + (1 if delta > 0 else -1)) % 12
         if self._scale > 0:
             self._apply_scale()
@@ -2841,15 +3218,22 @@ class PlayHandler(ModeHandlerBase):
         # affect notes already sounding, only new presses from here on.
         self._chain_manager.next_chain(nudge)
         self._update_leds()
+        # Keeps the OLED's own instrument-name fallback (see
+        # _instrument_label()/oled_status()) in sync - same reasoning as
+        # MixerHandler.refresh()'s own equivalent call.
+        if self._oled_refresh_cb:
+            self._oled_refresh_cb()
 
     def note_on(self, note, velocity, shifted_override=None):
-        if note == KNOB_VOLUME:
-            # Repurposed for tonic (see cc_change) - reset its own jitter
-            # filter on touch. Pan/Filter/Resonance have no use here - decline
-            # (return False below) and let the top-level driver's shared
-            # default reset theirs instead.
-            self._knobs_ease.reset(note)
-            return True
+        # Volume/Pan/Filter/Resonance have no use here any more (Tonic
+        # moved to Alt+Select, see cc_change/_adjust_tonic) - decline all
+        # 4 (return False below) and let the top-level driver's shared
+        # default (ZynpotRotate) handle them, same as every screen with no
+        # dedicated use for a given knob. Volume/Pan/Filter already reach
+        # the right chain that way (active chain's level/balance, Main's
+        # level respectively - same as Mixer's own knobs/the real Mixer
+        # screen's own zynpot handling) - update_mixer_strip below only
+        # adds the missing OLED feedback for that, reactively.
         if note == BTN_SOLO_1:
             # No specific "stop" target here (unlike StepSeq's Solo1) - a
             # panic button for this handler's own sustained notes instead.
@@ -2861,16 +3245,25 @@ class PlayHandler(ModeHandlerBase):
         if note == BTN_SOLO_3:
             self._toggle_solo()
             return True
-        if note == BTN_GRID_LEFT:
-            # Momentary flash to high-red on press, back to dull red on
-            # release (note_off below) - see _update_mode_leds' own comment
-            # for why these are just "bound"/"not bound", not boundary-aware.
-            self._leds.led_on(LED_GRID_LEFT, LED_RED_HIGH)
-            self._switch_chain(-1)
-            return True
-        if note == BTN_GRID_RIGHT:
-            self._leds.led_on(LED_GRID_RIGHT, LED_RED_HIGH)
-            self._switch_chain(1)
+        if note in (BTN_GRID_LEFT, BTN_GRID_RIGHT):
+            # Octave shift (swapped with Select, which switches chain here
+            # now - see cc_change/_switch_chain). Guarded against repeat
+            # Note On while held (see _held_grid's own comment in __init__)
+            # - not idempotent here, unlike chain switching.
+            if note in self._held_grid:
+                return True
+            self._held_grid.add(note)
+            self._shift_octave(-1 if note == BTN_GRID_LEFT else 1)
+            # Momentary flash to high-red on press (note == LED_GRID_LEFT/
+            # RIGHT - same value, see their own definitions), back to
+            # boundary-aware idle on release (note_off below) - unlike a
+            # flash on top of a FIXED idle color elsewhere, this one has to
+            # come after _shift_octave above (which already repaints via
+            # _paint_octave_leds on success) rather than before, or the
+            # repaint would immediately overwrite it. Flashes regardless of
+            # whether the shift actually succeeded (e.g. already at the
+            # edge) - still real tactile feedback that the press registered.
+            self._leds.led_on(note, LED_RED_HIGH)
             return True
         if note == BTN_PAT_UP:
             self._leds.led_on(LED_PAT_UP, LED_RED_HIGH)
@@ -2901,11 +3294,13 @@ class PlayHandler(ModeHandlerBase):
         return False
 
     def note_off(self, note, shifted_override=None):
-        if note == BTN_GRID_LEFT:
-            self._leds.led_on(LED_GRID_LEFT, LED_RED_DULL)
-            return
-        if note == BTN_GRID_RIGHT:
-            self._leds.led_on(LED_GRID_RIGHT, LED_RED_DULL)
+        if note in (BTN_GRID_LEFT, BTN_GRID_RIGHT):
+            # Revert the press-flash (see note_on) back to the current
+            # boundary-aware idle color - NOT necessarily what it was
+            # before the press, since the shift itself (if it succeeded)
+            # may have changed the headroom on either side.
+            self._held_grid.discard(note)
+            self._paint_octave_leds()
             return
         if note == BTN_PAT_UP:
             self._leds.led_on(LED_PAT_UP, LED_RED_DULL)
@@ -2926,16 +3321,17 @@ class PlayHandler(ModeHandlerBase):
 
     def cc_change(self, ccnum, ccval):
         if ccnum == KNOB_SELECT:
+            # Plain Select switches chain (swapped with Grid Left/Right,
+            # which shift the octave - see note_on), same idea as Mixer's
+            # own Select knob. Alt+Select adjusts Tonic instead - see
+            # note_on/_adjust_tonic. Select's own encoder isn't noisy like
+            # the other 4 (see ZynpotRotate's own comment), so no jitter
+            # filter needed for either.
             delta = ccval if ccval < 64 else ccval - 128
-            self._shift_octave(delta)
+            self._adjust_tonic(delta) if self._is_alt else self._switch_chain(delta)
             return True
-        if ccnum == KNOB_VOLUME:
-            delta = self._knobs_ease.feed(ccnum, ccval)
-            if delta is not None:
-                self._adjust_tonic(delta)
-            return True
-        # Pan/Filter/Resonance have no use here - decline, top-level driver's
-        # shared default (ZynpotRotate) picks them up instead.
+        # Volume/Pan/Filter/Resonance have no use here - decline, top-level
+        # driver's shared default (ZynpotRotate) picks all 4 up instead.
         return None
 
 
@@ -3009,7 +3405,10 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             self._mixer_handler: "Mixer",
             self._zynpad_handler: "Zynpad",
             self._stepseq_handler: "StepSeq",
-            self._play_handler: "Play",
+            # Only actually shown in Piano layout - Chromatic overrides it
+            # with the current scale name instead, see PlayHandler's own
+            # oled_label().
+            self._play_handler: "Keys",
         }
 
         # Shift itself has no local state to track any more - it's just a
@@ -3338,15 +3737,23 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         # too overloaded for a 2-state LED to represent accurately, so this
         # is deliberately just "is this button bound to anything right now"
         # rather than boundary-aware: dull red while the current mode uses
-        # it at all, off where it's a no-op (nothing is, right now - every
-        # mode binds both). The momentary flash to high-red on an actual
-        # press (mirroring Alt/Bank's own touch-flash) is each handler's own
-        # note_on/note_off, not here - this only sets the idle baseline.
-        grid_bound = self._current_handler in (self._mixer_handler, self._stepseq_handler,
-                                                self._play_handler, self._zynpad_handler)
+        # it at all, off where it's a no-op. The momentary flash to
+        # high-red on an actual press (mirroring Alt/Bank's own
+        # touch-flash) is each handler's own note_on/note_off, not here -
+        # this only sets the idle baseline. Exceptions: Play mode's own
+        # Grid Left/Right (swapped with Select to do octave-shift instead
+        # of chain-switch - see PlayHandler.note_on/cc_change) and Mixer's
+        # own (paging chains left/right - see MixerHandler.note_on) both
+        # have a single fixed meaning with no modifier overloading, so they
+        # CAN be boundary-aware - each of those handlers owns painting
+        # those two itself instead (see PlayHandler._paint_octave_leds/
+        # MixerHandler._paint_grid_leds), skipped here entirely so the two
+        # don't fight over the same LEDs.
+        if self._current_handler not in (self._play_handler, self._mixer_handler):
+            grid_bound = self._current_handler in (self._stepseq_handler, self._zynpad_handler)
+            for led in (LED_GRID_LEFT, LED_GRID_RIGHT):
+                self._leds.led_on(led, LED_RED_DULL) if grid_bound else self._leds.led_off(led)
         pattern_bound = self._current_handler in (self._stepseq_handler, self._play_handler, self._zynpad_handler)
-        for led in (LED_GRID_LEFT, LED_GRID_RIGHT):
-            self._leds.led_on(led, LED_RED_DULL) if grid_bound else self._leds.led_off(led)
         for led in (LED_PAT_UP, LED_PAT_DOWN):
             self._leds.led_on(led, LED_RED_DULL) if pattern_bound else self._leds.led_off(led)
 
@@ -3370,6 +3777,18 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
 
     def _refresh_oled(self):
         label = self._mode_labels.get(self._current_handler, "")
+        # oled_label() is an optional per-handler hook (Mixer/PlayHandler
+        # use it) to override the mode-name label itself - a showing
+        # Volume/Balance/Octave/Main-volume transient (see each handler's
+        # own _show_value/_show_octave/_show_chain_value) takes over this
+        # row too so it gets the whole screen (value here, the chain it
+        # belongs to on the status row below - see oled_status()); Play
+        # mode's Chromatic layout also swaps it for the current scale name
+        # the rest of the time, rather than wasting its own label row on
+        # the fixed word "Play".
+        get_label = getattr(self._current_handler, "oled_label", None)
+        if get_label is not None:
+            label = get_label() or label
         self._oled.clear()
         # oled_status() is an optional per-handler hook (every handler has
         # one now: Mixer/StepSeq's live Volume/Balance/Velocity/etc.
@@ -3380,11 +3799,14 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         get_status = getattr(self._current_handler, "oled_status", None)
         status = get_status() if get_status is not None else None
         if status:
-            self._oled.text(0, 4, label, size=16, center_x=True)
-            # text_fit rather than a fixed size - scale names vary a lot in
-            # length (e.g. "C Major" vs. "C# Harmonic Minor") and scales.json
-            # is a user-editable file, so there's no fixed upper bound on
-            # this string worth hardcoding a size for.
+            # text_fit rather than a fixed size on either line - the fixed
+            # mode-name labels (Mixer/Zynpad/StepSeq/Keys) all already fit
+            # at size 16 so this changes nothing for them, but Play mode's
+            # own oled_label() override puts a scale name here instead,
+            # which varies a lot in length (e.g. "C Major" vs. "C# Harmonic
+            # Minor") - scales.json is a user-editable file, so there's no
+            # fixed upper bound on it worth hardcoding a size for.
+            self._oled.text_fit(4, label, max_size=16, min_size=9)
             self._oled.text_fit(34, status, max_size=16, min_size=9)
         else:
             # size=24 is the largest that keeps the widest label ("StepSeq")
@@ -3447,15 +3869,18 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                 # Alt+Perform (ZS3) work from any mode, so _is_alt itself is
                 # tracked unconditionally above - but only forward into
                 # MixerHandler (its Alt+Solo-N = toggle solo modifier),
-                # StepSeqHandler (its Alt+Filter = play chance modifier) or
-                # ZynpadHandler (its Alt+Solo3/4 = cycle backwards) while
-                # one of them is actually the active mode.
+                # StepSeqHandler (its Alt+Filter = play chance modifier),
+                # ZynpadHandler (its Alt+Solo3/4 = cycle backwards) or
+                # PlayHandler (its Alt+Select = adjust Tonic) while one of
+                # them is actually the active mode.
                 if self._current_handler is self._mixer_handler:
                     self._mixer_handler.set_alt(True)
                 elif self._current_handler is self._stepseq_handler:
                     self._stepseq_handler.set_alt(True)
                 elif self._current_handler is self._zynpad_handler:
                     self._zynpad_handler.set_alt(True)
+                elif self._current_handler is self._play_handler:
+                    self._play_handler.set_alt(True)
                 return True
             if note == BTN_STEP:
                 if self._current_handler is self._play_handler:
@@ -3664,6 +4089,8 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                     self._stepseq_handler.set_alt(False)
                 elif self._current_handler is self._zynpad_handler:
                     self._zynpad_handler.set_alt(False)
+                elif self._current_handler is self._play_handler:
+                    self._play_handler.set_alt(False)
                 return True
             if note in (BTN_PLAY, BTN_STOP):
                 self._btn_timer.is_released(note)
@@ -3693,9 +4120,14 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         # to keep fresh for later), so skip it entirely while Mixer isn't the
         # visible mode - otherwise e.g. turning a knob on some other screen
         # (or any other zctrl change reaching here) would paint mixer bars on
-        # top of whatever's actually showing on the grid.
+        # top of whatever's actually showing on the grid. PlayHandler's own
+        # version only ever touches its own OLED transient (nothing visible
+        # to leak onto another mode's grid), but still guarded the same way
+        # for consistency - no point tracking a value nobody's about to see.
         if self._current_handler is self._mixer_handler:
             self._mixer_handler.update_mixer_strip(chan, symbol, value)
+        elif self._current_handler is self._play_handler:
+            self._play_handler.update_mixer_strip(chan, symbol, value)
 
     def update_mixer_active_chain(self, active_chain):
         self._mixer_handler.set_active_chain(active_chain, self._current_handler is self._mixer_handler)
@@ -3786,6 +4218,8 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             self._stepseq_handler.set_alt(self._is_alt)
         elif handler is self._zynpad_handler:
             self._zynpad_handler.set_alt(self._is_alt)
+        elif handler is self._play_handler:
+            self._play_handler.set_alt(self._is_alt)
         # set_active() is a no-op for most handlers - the exceptions being
         # PlayHandler (stops any still-sounding notes on the way out) and
         # StepSeqHandler (starts/stops its playhead poll timer) - harmless
