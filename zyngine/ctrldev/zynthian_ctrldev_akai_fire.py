@@ -710,6 +710,69 @@ def _select_knob_arrow(state_manager, ccval, is_alt=False):
         state_manager.send_cuia("ARROW_UP" if delta > 0 else "ARROW_DOWN")
 
 
+class MixerUndoManager:
+    """Shared Undo/Redo history for zynmixer state (level/balance/mute/
+    solo/mono/phase - see zynthian_engine_audio_mixer.py's own get_state/
+    set_state). One instance lives on the top-level driver and is handed
+    to both MixerHandler (which owns the actual Undo/Redo buttons,
+    Pattern Up/Down - see its own note_on) and PlayHandler (no buttons
+    of its own for this, but still feeds the same history: its
+    Volume/Pan/Filter knobs and Solo2/3 mute/solo reach zynmixer too -
+    see PlayHandler's own note_on/_toggle_mute/_toggle_solo). zynmixer
+    itself is a single shared object (state_manager.zynmixer, see
+    ModeHandlerBase.__init__) regardless of which handler/code path
+    actually changes it - including the shared ZynpotRotate->CUIA path
+    Mixer's own Filter/Resonance and all 4 of Play's knobs use, which
+    never calls into our own zynmixer wrapper directly - so a plain
+    before/after get_state() snapshot captures a change correctly
+    regardless of how it actually happened.
+
+    Two calling conventions, matching the two ways a change can occur:
+    - A continuous touch-and-turn (a knob): begin() on touch (note_on),
+      commit() on release (note_off) - mirrors StepSeqHandler's own
+      _knob_dirty/savePatternSnapshot batching (one undo step per turn
+      session, not per tick).
+    - A discrete one-shot action (a bar-pad tap, a mute/solo toggle):
+      begin() and commit() called back-to-back, synchronously, around
+      the single mutation - no open session to worry about.
+
+    get_state()/set_state() already only round-trip off-default values
+    (see get_state's own code) - a sparse dict, cheap to snapshot and
+    compare - and set_state(..., True) resets anything the snapshot
+    omits back to default, giving an exact restore either way."""
+
+    def __init__(self, zynmixer):
+        self._zynmixer = zynmixer
+        self._undo_stack = []
+        self._redo_stack = []
+        self._pending = None
+
+    def begin(self):
+        self._pending = self._zynmixer.get_state(True)
+
+    def commit(self):
+        if self._pending is None:
+            return
+        pending, self._pending = self._pending, None
+        if self._zynmixer.get_state(True) != pending:
+            self._undo_stack.append(pending)
+            self._redo_stack.clear()
+
+    def undo(self):
+        if not self._undo_stack:
+            return False
+        self._redo_stack.append(self._zynmixer.get_state(True))
+        self._zynmixer.set_state(self._undo_stack.pop(), True)
+        return True
+
+    def redo(self):
+        if not self._redo_stack:
+            return False
+        self._undo_stack.append(self._zynmixer.get_state(True))
+        self._zynmixer.set_state(self._redo_stack.pop(), True)
+        return True
+
+
 class TransientOledLine:
     """Shared timed-auto-hide OLED secondary-line helper: show(text) makes
     it the current mode's secondary OLED line (see the top-level driver's
@@ -822,9 +885,13 @@ class MixerHandler(ModeHandlerBase):
     # persistent global toggle, see _alt_mode() - NOT momentarily holding
     # BTN_ALT, that's the unrelated Alt+Solo-N modifier below) - balance
     # (green, filled outward from center: right for positive, left for
-    # negative, nothing lit at 0).
+    # negative). At dead center (0), neither side has anything to fill -
+    # the two center pads (7/8) get a dim white reference marker instead
+    # of sitting dark, same idea/value as StepSeqHandler's own
+    # COLOR_TONIC_EMPTY guide tint.
     BAR_COLOR_VOLUME = (90, 0, 0)
     BAR_COLOR_BALANCE = (0, 90, 0)
+    BAR_COLOR_BALANCE_CENTER = (18, 18, 18)
 
     # A single tap jumps to a pad's coarse position (1/16th steps for volume,
     # 1/8th per side for balance) - too coarse for fine adjustment, and for
@@ -859,7 +926,7 @@ class MixerHandler(ModeHandlerBase):
     # smallest one, barely finer than the 4 this replaces.
     FINE_STEPS = 5
 
-    def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs, oled_refresh_cb=None):
+    def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs, oled_refresh_cb=None, mixer_undo=None):
         super().__init__(state_manager)
         self._leds = leds
         self._pads = pads
@@ -869,6 +936,7 @@ class MixerHandler(ModeHandlerBase):
         self._knobs_ease = KnobJitterFilter()
         self._last_tapped_col = [None] * 4  # per row, see _on_bar_pad
         self._center_held = [set(), set(), set(), set()]  # per row, see _on_bar_pad
+        self._mixer_undo = mixer_undo  # see MixerUndoManager, Pattern Up/Down below
 
         active_chain = self._chain_manager.get_active_chain()
         self._active_chain = active_chain.chain_id if active_chain else 0
@@ -878,6 +946,14 @@ class MixerHandler(ModeHandlerBase):
         # see TransientOledLine.
         self._oled_value = TransientOledLine(oled_refresh_cb)
         self._oled_value_chain_id = None  # chain_id _show_value() last showed a value for
+        # Separate from _oled_value above - Undo/Redo (see _undo/_redo)
+        # has no chain of its own the way a Volume/Balance edit does, and
+        # reads as a short status-line message ("Nothing To Undo" etc.),
+        # not a big promoted headline (oled_label() would need a smaller
+        # font to even fit that text) - so it gets its own transient,
+        # checked first in oled_status() below, leaving oled_label() and
+        # the rest of oled_status() untouched.
+        self._oled_message = TransientOledLine(oled_refresh_cb)
         self._oled_refresh_cb = oled_refresh_cb  # see refresh()/_instrument_label()
 
     def refresh(self):
@@ -926,13 +1002,20 @@ class MixerHandler(ModeHandlerBase):
 
     def oled_status(self):
         """Secondary OLED line while Mixer is active (see the top-level
-        driver's _refresh_oled) - the name of the chain a showing
-        Volume/Balance transient actually belongs to (see _show_value/
-        oled_label(), tracked separately from the active chain - see its
-        own comment) takes priority for a couple seconds after a knob/pad
-        edit; otherwise the active chain's own instrument name (see
-        _instrument_label()), or None (falls back to the plain centered
-        "Mixer" label) if there's no active chain."""
+        driver's _refresh_oled) - an Undo/Redo message (see _undo/_redo,
+        _oled_message) takes priority first, shown as a plain small
+        status line under the usual "Mixer" label rather than promoted
+        to oled_label() the way Volume/Balance is - "Nothing To Undo"/
+        "Nothing To Redo" don't fit at the big label's font size. Next,
+        the name of the chain a showing Volume/Balance transient
+        actually belongs to (see _show_value/oled_label(), tracked
+        separately from the active chain - see its own comment) for a
+        couple seconds after a knob/pad edit; otherwise the active
+        chain's own instrument name (see _instrument_label()), or None
+        (falls back to the plain centered "Mixer" label) if there's no
+        active chain."""
+        if self._oled_message.text:
+            return self._oled_message.text
         if self._oled_value.text:
             chain = self._chain_manager.get_chain(self._oled_value_chain_id)
             return chain.get_description(1) if chain is not None else None
@@ -1120,6 +1203,14 @@ class MixerHandler(ModeHandlerBase):
             neg = -fine_pos
             for i in range(8):
                 colors[7 - i] = cls._fine_color(neg, i * cls.FINE_STEPS, (i + 1) * cls.FINE_STEPS, cls.BAR_COLOR_BALANCE)
+        else:
+            # Dead center - neither side has anything to fill, so the two
+            # center pads would otherwise just sit dark. A dim white
+            # marker here doubles as "this is where 0 is" (useful, since
+            # unlike volume's fixed left edge, balance's center isn't a
+            # hardware-obvious reference point) and as decoration (less
+            # of the pad matrix sitting unlit).
+            colors[7] = colors[8] = cls.BAR_COLOR_BALANCE_CENTER
         return colors
 
     def _on_bar_pad(self, note):
@@ -1129,6 +1220,12 @@ class MixerHandler(ModeHandlerBase):
         if chain is None:
             return True
 
+        # One-shot action (tap, not a touch-and-turn session) - begin()
+        # and commit() bracket the single mutation below, whichever
+        # branch actually fires (see MixerUndoManager's own comment on
+        # the two calling conventions).
+        self._mixer_undo.begin()
+
         if _alt_mode() and col in (7, 8):
             self._center_held[pos].add(col)
             if len(self._center_held[pos]) == 2:
@@ -1137,6 +1234,7 @@ class MixerHandler(ModeHandlerBase):
                 self._last_tapped_col[pos] = None
                 self._paint_row(pos)
                 self._show_value(chain, is_balance=True)
+                self._mixer_undo.commit()
                 return True
 
         # Tapping the same physical pad as last time on this row = fine
@@ -1176,6 +1274,7 @@ class MixerHandler(ModeHandlerBase):
 
         self._paint_row(pos)
         self._show_value(chain, is_balance=_alt_mode())
+        self._mixer_undo.commit()
         return True
 
     def _off_bar_pad(self, note):
@@ -1190,6 +1289,29 @@ class MixerHandler(ModeHandlerBase):
         # doesn't need to repaint anything.
         self._is_alt = state
 
+    def _undo(self):
+        """Pattern Up - see MixerUndoManager. Covers every way a mixer
+        value can change: Volume/Pan/bar-pad taps/Solo-N mute+solo here,
+        plus Play mode's own Volume/Pan/Filter/Resonance and Solo2/3
+        mute+solo (same shared MixerUndoManager instance, see the
+        top-level driver's __init__) - undoing right after switching
+        back from Play still reaches those. Uses _oled_message, not
+        _oled_value - see oled_status()'s own comment on why this is a
+        small status-line message, not a promoted big label."""
+        if self._mixer_undo.undo():
+            self.refresh()
+            self._oled_message.show("Undo")
+        else:
+            self._oled_message.show("Nothing To Undo")
+
+    def _redo(self):
+        """Pattern Down - see _undo."""
+        if self._mixer_undo.redo():
+            self.refresh()
+            self._oled_message.show("Redo")
+        else:
+            self._oled_message.show("Nothing To Redo")
+
     def note_on(self, note, velocity, shifted_override=None):
         self._on_shifted_override(shifted_override)
 
@@ -1201,6 +1323,9 @@ class MixerHandler(ModeHandlerBase):
         # update_mixer_strip below).
         if note in (KNOB_VOLUME, KNOB_PAN):
             self._knobs_ease.reset(note)
+            # Start of a touch-and-turn session for the undo history (see
+            # MixerUndoManager) - committed on release, note_off below.
+            self._mixer_undo.begin()
             return True
 
         if PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64:
@@ -1212,15 +1337,29 @@ class MixerHandler(ModeHandlerBase):
                 return True
 
             if self._is_shifted:
+                self._mixer_undo.begin()
                 val = self._zynmixer.get_mute(chain.mixer_chan) ^ 1
                 self._zynmixer.set_mute(chain.mixer_chan, val, True)
+                self._mixer_undo.commit()
             elif self._is_alt:
+                self._mixer_undo.begin()
                 val = self._zynmixer.get_solo(chain.mixer_chan) ^ 1
                 self._zynmixer.set_solo(chain.mixer_chan, val, True)
+                self._mixer_undo.commit()
             else:
                 self._chain_manager.set_active_chain_by_id(chain.chain_id)
                 self._active_chain = chain.chain_id
             self.refresh()
+            return True
+
+        if note == BTN_PAT_UP:
+            self._leds.led_on(LED_PAT_UP, LED_RED_HIGH)
+            self._undo()
+            return True
+
+        if note == BTN_PAT_DOWN:
+            self._leds.led_on(LED_PAT_DOWN, LED_RED_HIGH)
+            self._redo()
             return True
 
         if note == BTN_GRID_LEFT:
@@ -1267,6 +1406,18 @@ class MixerHandler(ModeHandlerBase):
             # before the press, since paging (if it moved) may have
             # changed the headroom on either side.
             self._paint_grid_leds()
+        elif note in ZYNPOT_KNOBS:
+            # End of the touch-and-turn session - a no-op if nothing
+            # actually changed (touched but never turned). Covers all 4
+            # knobs, not just Volume/Pan: Filter/Resonance's own touch in
+            # Mixer mode declines to the shared default (see note_on's
+            # own comment, and the top-level driver's _default_note_on),
+            # but note_off is always routed to _current_handler regardless
+            # of which path handled the touch, so this still fires - and
+            # still needs to commit - for those too.
+            self._mixer_undo.commit()
+        elif note in (BTN_PAT_UP, BTN_PAT_DOWN):
+            self._leds.led_on(note, LED_RED_DULL)
 
     def cc_change(self, ccnum, ccval):
         # Select's own encoder isn't noisy like the other 4 - use it raw.
@@ -3576,12 +3727,13 @@ class PlayHandler(ModeHandlerBase):
     PIANO_BAND_OFFSET = 24  # semitones between the two bands (2 octaves)
 
     def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs, notes_queue: mp.Queue,
-                 oled_refresh_cb=None):
+                 oled_refresh_cb=None, mixer_undo=None):
         super().__init__(state_manager)
         self._leds = leds
         self._pads = pads
         self._notes_queue = notes_queue  # drained by the driver's midiproc_task
         self._oled_refresh_cb = oled_refresh_cb  # top-level driver's _refresh_oled, see _on_scale_changed
+        self._mixer_undo = mixer_undo  # see MixerUndoManager, _toggle_mute/_toggle_solo/note_off below
         # Live octave-shift/Volume/Balance/Main-volume readout (see
         # _shift_base_note/_shift_keymap_offset/update_mixer_strip/
         # oled_label/oled_status) while Grid Left/Right shifts the octave,
@@ -4081,14 +4233,18 @@ class PlayHandler(ModeHandlerBase):
         chain = self._chain_manager.get_active_chain()
         if chain is None:
             return
+        self._mixer_undo.begin()
         self._zynmixer.set_mute(chain.mixer_chan, self._zynmixer.get_mute(chain.mixer_chan) ^ 1, True)
+        self._mixer_undo.commit()
         self._update_leds()
 
     def _toggle_solo(self):
         chain = self._chain_manager.get_active_chain()
         if chain is None:
             return
+        self._mixer_undo.begin()
         self._zynmixer.set_solo(chain.mixer_chan, self._zynmixer.get_solo(chain.mixer_chan) ^ 1, True)
+        self._mixer_undo.commit()
         self._update_leds()
 
     def _switch_chain(self, nudge):
@@ -4189,6 +4345,13 @@ class PlayHandler(ModeHandlerBase):
         if note == BTN_PAT_DOWN:
             self._leds.led_on(LED_PAT_DOWN, LED_RED_DULL)
             return
+        if note in ZYNPOT_KNOBS:
+            # End of a touch-and-turn session on one of the 4 knobs - all
+            # declined in note_on (see its own comment) and so routed
+            # through the shared default (_default_note_on already
+            # started this same session on touch) - see MixerUndoManager.
+            self._mixer_undo.commit()
+            return
         if not (PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64):
             return
         info = self._held.pop(note, None)
@@ -4248,11 +4411,17 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         # in the base class) - PlayHandler puts (status, note, vel) tuples here,
         # midiproc_task drains and emits them on its own real-time JACK port.
         self._play_notes_queue = mp.Queue()
-        self._mixer_handler = MixerHandler(state_manager, self._leds, self._pads, self._refresh_oled)
+        # Shared Undo/Redo history for zynmixer state (level/balance/mute/
+        # solo) - Mixer owns the actual buttons (Pattern Up/Down), Play
+        # feeds the same history without any buttons of its own - see
+        # MixerUndoManager's own class comment.
+        self._mixer_undo = MixerUndoManager(state_manager.zynmixer)
+        self._mixer_handler = MixerHandler(state_manager, self._leds, self._pads, self._refresh_oled,
+                                            self._mixer_undo)
         self._zynpad_handler = ZynpadHandler(state_manager, self._leds, self._pads, self._refresh_oled)
         self._stepseq_handler = StepSeqHandler(state_manager, self._leds, self._pads, self._refresh_oled)
         self._play_handler = PlayHandler(state_manager, self._leds, self._pads, self._play_notes_queue,
-                                          self._refresh_oled)
+                                          self._refresh_oled, self._mixer_undo)
         # Mixer is the default/fallback mode: whatever screen has no
         # dedicated mode of its own (Admin, Preset, Control, Snapshot, main
         # menu, etc., now that DeviceHandler is gone) just keeps showing
@@ -4665,7 +4834,14 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             grid_bound = self._current_handler is self._zynpad_handler
             for led in (LED_GRID_LEFT, LED_GRID_RIGHT):
                 self._leds.led_on(led, LED_RED_DULL) if grid_bound else self._leds.led_off(led)
-        pattern_bound = self._current_handler in (self._stepseq_handler, self._play_handler, self._zynpad_handler)
+        # Mixer added here once Pattern Up/Down gained a use of their own
+        # there (Undo/Redo for the zynmixer history - see
+        # MixerHandler.note_on/_undo/_redo/MixerUndoManager) - previously
+        # these were unconditionally off in Mixer mode, the one genuinely
+        # free pair of buttons that made this binding possible in the
+        # first place.
+        pattern_bound = self._current_handler in (self._stepseq_handler, self._play_handler,
+                                                    self._zynpad_handler, self._mixer_handler)
         for led in (LED_PAT_UP, LED_PAT_DOWN):
             self._leds.led_on(led, LED_RED_DULL) if pattern_bound else self._leds.led_off(led)
 
@@ -5095,6 +5271,16 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         every handler with nothing more specific for it already sent."""
         if note in ZYNPOT_KNOBS:
             self._default_zynpot.reset(note)
+            # This shared fallback is exactly how Mixer's own Filter/
+            # Resonance and all 4 of Play's knobs reach zynmixer (via
+            # ZYNPOT->CUIA, see ZynpotRotate's own class comment) - start
+            # the same undo-history touch session MixerHandler's own
+            # Volume/Pan touch starts directly (see its note_on), so
+            # those changes get captured too. Gated on which handler
+            # currently owns the knobs so StepSeq/Zynpad touches (never
+            # reaching zynmixer) don't pollute the mixer undo history.
+            if self._knobs_handler in (self._mixer_handler, self._play_handler):
+                self._mixer_undo.begin()
             return True
         if note == BTN_SELECT_PRESS:
             self.state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
