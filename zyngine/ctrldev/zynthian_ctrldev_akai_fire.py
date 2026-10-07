@@ -1621,6 +1621,17 @@ class ZynpadHandler(ModeHandlerBase):
     COLOR_STARTING = (90, 90, 90)   # bright white - SEQ_STARTING / SEQ_RESTARTING
     COLOR_STOPPING = (25, 25, 25)   # dim white - SEQ_STOPPING / SEQ_STOPPINGSYNC
 
+    # Selection indicator (see note_on's plain-pad path/_flash_selected) -
+    # a brief flash rather than a permanent highlight color: between
+    # COLOR_EMPTY/STARTING/STOPPING and all 16 GROUP_COLORS at 2
+    # brightness levels each, there's no hue left that's guaranteed to
+    # contrast with whatever a given pad's own state color happens to be
+    # - a temporary pulse sidesteps that entirely (same idea as a
+    # display toast), at full brightness (127) so it reads as clearly
+    # "brighter than anything real" even against COLOR_STARTING's own 90.
+    COLOR_SELECT_FLASH = (127, 127, 127)
+    SELECT_FLASH_MS = 300   # 1.5x the original 200, tuned live on hardware
+
     def __init__(self, state_manager, leds, pads: PadLEDs, oled_refresh_cb=None):
         super().__init__(state_manager)
         self._leds = leds
@@ -1663,6 +1674,23 @@ class ZynpadHandler(ModeHandlerBase):
         # *different* pad gets selected (stale info about the pad you've
         # moved on from isn't useful) - see note_on's plain-pad path.
         self._oled_status = TransientOledLine(oled_refresh_cb, self.STATUS_TIMEOUT_MS)
+        # Raw refresh callback (same one handed to TransientOledLine
+        # above) - _on_selection_changed calls this directly, not
+        # through _oled_status, since a selection change needs the OLED
+        # redrawn even when _oled_status has nothing showing (that's
+        # exactly the common case) and TransientOledLine's own show()/
+        # hide() only trigger a repaint when ITS OWN text actually
+        # changes.
+        self._oled_refresh_cb = oled_refresh_cb
+
+        # One-shot revert timer for the selection flash (see
+        # _flash_selected) - RunTimer, not IntervalTimer, same reasoning
+        # as TransientOledLine's own choice (its class comment has the
+        # full story): fire once after SELECT_FLASH_MS, not immediately
+        # then repeatedly. _flashed_pos tracks which pad it's currently
+        # pending for, if any - see _flash_selected's own comment on why.
+        self._select_flash_timer = RunTimer()
+        self._flashed_pos = None
 
     def set_alt(self, state):
         self._is_alt = state
@@ -1711,6 +1739,53 @@ class ZynpadHandler(ModeHandlerBase):
             return
         seq = self._zynseq.get_pad_from_xy(lcol, lrow)
         self._pads.set_pad(note, *self._seq_color(seq))
+
+    def _flash_selected(self, col, row):
+        """Brief visual acknowledgment that this pad just became the
+        selected one (see note_on's plain-pad path) - COLOR_SELECT_FLASH
+        for SELECT_FLASH_MS, then back to whatever _paint_pad would
+        normally show. Best-effort: togglePlayState's own async state
+        change (e.g. Stopped -> Starting, see update_seq_state) can
+        repaint this same pad with the real new state color before the
+        timer fires, superseding the flash early - acceptable, real
+        playback state is more important than the selection pulse."""
+        # If a previous flash is still pending (this one's own RunTimer
+        # slot is a single named entry, "select_flash" - re-add()ing it
+        # below for the new pad abandons whatever callback was already
+        # queued for the old one), revert that pad right now instead of
+        # leaving it stuck lit forever once its own revert never fires -
+        # found on hardware once selection could change fast enough
+        # (Select-knob spun quickly) to trigger this before the first
+        # flash's SELECT_FLASH_MS was even up.
+        if self._flashed_pos is not None and self._flashed_pos != (col, row):
+            self._paint_pad(*self._flashed_pos)
+        self._flashed_pos = (col, row)
+        self._pads.set_pad(_pad(row, col), *self.COLOR_SELECT_FLASH)
+        self._select_flash_timer.add("select_flash", self.SELECT_FLASH_MS, self._on_flash_timeout)
+
+    def _on_flash_timeout(self, name=None):
+        if self._flashed_pos is not None:
+            self._paint_pad(*self._flashed_pos)
+            self._flashed_pos = None
+
+    def _on_selection_changed(self, seq):
+        """Common follow-up for every way the selected pad can actually
+        change - a plain pad press (note_on below) or a Select-knob
+        cursor move (cc_change below). Hides a stale Solo3/4 status
+        line, flashes the newly selected pad (see _flash_selected), and
+        forces an OLED repaint - oled_status()'s own fallback (the new
+        pad's name) would otherwise just sit showing the *previous*
+        pad's name until some unrelated event happened to trigger a
+        redraw, same gap already found/fixed for StepSeq's own Pattern
+        Up/Down scrolling (_refresh_oled only ever runs on an explicit
+        push)."""
+        if self._oled_status.text is not None:
+            self._oled_status.hide()
+        lcol, lrow = self._zynseq.get_xy_from_pad(seq)
+        if lcol < 8 and lrow < 8:
+            self._flash_selected(*self._physical_xy(lcol, lrow))
+        if self._oled_refresh_cb:
+            self._oled_refresh_cb()
 
     def _seq_color(self, seq):
         packed = self._libseq.getSequenceState(self._zynseq.bank, seq)
@@ -1799,6 +1874,8 @@ class ZynpadHandler(ModeHandlerBase):
             if pattern >= 0:
                 self._copy_source_pattern = pattern
                 self._update_leds()
+                name = self._zynseq.get_sequence_name(self._zynseq.bank, seq)
+                self._oled_status.show(f"Copied: {name}")
             return True
         if note == BTN_SOLO_2:
             # Paste: copy source pattern -> the selected pad's own pattern.
@@ -1841,6 +1918,8 @@ class ZynpadHandler(ModeHandlerBase):
                     zynpad_screen = zynthian_gui_config.zyngui.screens.get("zynpad")
                     if zynpad_screen is not None:
                         zynpad_screen.refresh_pad(seq)
+                    name = self._zynseq.get_sequence_name(self._zynseq.bank, seq)
+                    self._oled_status.show(f"Pasted: {name}")
             return True
         if note == BTN_SOLO_3:
             # Cycle the selected pad's Play mode (Zynpad menu > Play mode) -
@@ -1886,13 +1965,15 @@ class ZynpadHandler(ModeHandlerBase):
         # Also marks this pad "selected" (same field the touchscreen's own
         # pop-up menu and Solo1-4 above operate on) - a plain press already
         # means "this is the pad I'm working with right now", no need for a
-        # separate selection gesture. Hides Solo3/4's OLED status line if
-        # this is actually a *different* pad than was selected before -
-        # stale info about the pad you've moved on from isn't useful -
-        # re-pressing the same pad doesn't disturb it.
-        if self._oled_status.text is not None and seq != self._get_selected_sequence():
-            self._oled_status.hide()
+        # separate selection gesture. _on_selection_changed (hides a stale
+        # Solo3/4 status line, flashes the pad, repaints the OLED) only
+        # fires if this is actually a *different* pad than was selected
+        # before - re-pressing the same pad doesn't need acknowledging
+        # again, it's visibly already the selected one.
+        is_new_selection = seq != self._get_selected_sequence()
         self._select_pad(seq)
+        if is_new_selection:
+            self._on_selection_changed(seq)
         self._libseq.togglePlayState(self._zynseq.bank, seq)
         return True
 
@@ -1995,14 +2076,111 @@ class ZynpadHandler(ModeHandlerBase):
     def oled_status(self):
         """Secondary OLED line while Zynpad is active (see the top-level
         driver's _refresh_oled) - the transient Play-mode/MIDI-channel
-        readout from _status_text() above, shown via _oled_status
-        (Solo3/4 were pressed recently, same pad still selected). None
-        (falls back to the plain centered "Zynpad" label) once that's
-        timed out or hidden, same as every mode with nothing to show."""
-        return self._oled_status.text
+        readout from _status_text() above, or a Copy/Paste toast (see
+        note_on's Solo1/Solo2 branches), shown via _oled_status for a
+        few seconds after the triggering action; otherwise the
+        currently selected pad's own name + MIDI channel (zynseq's own
+        per-sequence name field, same one the touchscreen's pop-up menu
+        lets you rename - get_sequence_name() - plus getChannel(), same
+        "Ch N" convention _status_text() above already uses), so
+        there's always some indication of which pad Solo1-4/a pad press
+        would currently act on and which channel it plays, not just
+        right after actually doing something to it. None only if
+        there's no selected pad at all (falls back to the plain
+        centered "Zynpad" label)."""
+        if self._oled_status.text:
+            return self._oled_status.text
+        seq = self._get_selected_sequence()
+        if seq is None:
+            return None
+        bank = self._zynseq.bank
+        name = self._zynseq.get_sequence_name(bank, seq)
+        chan = self._libseq.getChannel(bank, seq, 0) + 1
+        # An empty name (a sequence that never went through the normal
+        # naming step - see get_sequence_name's own call sites in
+        # zynseq.py) would otherwise read as " - Ch N", a stray leading
+        # dash with nothing in front of it - just the channel on its
+        # own instead.
+        if not name:
+            return f"Ch {chan}"
+        return f"{name} - Ch {chan}"
 
-    # No cc_change override - nothing zynpad-specific for the 4 knobs or
-    # Select either, base class declines everything (see note_on above).
+    def _move_selection_row(self, dval):
+        """Alt+Select - exact port of zynthian_gui_zynpad.py's own
+        zynpot_cb (ctrl_order[3] branch, reached there via
+        arrow_left/arrow_right while Alt is held) - a whole-row jump
+        that wraps the resulting pad index across row/column boundaries,
+        which is NOT simply "add col_in_bank, clamp to [0, count)" the
+        way the plain single-step case is (see cc_change). Ported
+        verbatim (variable names included) rather than re-derived, to
+        stay exactly in sync with whatever that screen's own version
+        actually does - including its own quirk of only bounds-checking
+        against col_in_bank, not the bank's actual populated sequence
+        count the way the plain case does (unchanged here, on purpose -
+        this is a port, not a fix for a screen we don't own). `col`
+        uses int(pad / col_in_bank) rather than Python's own // on
+        purpose too - the original's `int(pad / self.col_in_bank)`
+        truncates toward zero, which disagrees with // (floors) for a
+        negative pad; `row`'s own `%` doesn't have this problem (both
+        this file and the original are Python, so % already means the
+        same floor-based thing in both) - only col needed the explicit
+        int(.../...) spelling to match."""
+        seq = self._get_selected_sequence()
+        if seq is None:
+            return None
+        col_in_bank = self._zynseq.col_in_bank
+        pad = seq + col_in_bank * dval
+        col = int(pad / col_in_bank)
+        row = pad % col_in_bank
+        if col >= col_in_bank:
+            col = 0
+            row += 1
+            pad = row + col_in_bank * col
+        elif pad < 0:
+            col = col_in_bank - 1
+            row -= 1
+            pad = row + col_in_bank * col
+        if row < 0 or row >= col_in_bank or col >= col_in_bank:
+            return None
+        return pad
+
+    def cc_change(self, ccnum, ccval):
+        # Volume/Pan/Filter/Resonance still have no zynpad-specific use -
+        # decline, base class default (ZynpotRotate) picks them up.
+        if ccnum != KNOB_SELECT:
+            return None
+        # Same cursor moves zynthian_gui_zynpad.py's own zynpot_cb
+        # performs (ctrl_order[2]/[3], reached there via
+        # arrow_up/down/left/right), just called directly instead of
+        # round-tripping through that ARROW_* CUIA: a first cut polled
+        # _get_selected_sequence() instead (see the plan doc), since
+        # neither that CUIA nor select_pad() itself emits any signal
+        # this driver could otherwise hook - but polling had its own
+        # real bugs and needed a timer at all only because nothing told
+        # us *when* to check. Calling select_pad() ourselves means we
+        # already know synchronously, the moment it happens - no
+        # "starting position" to separately track either,
+        # _get_selected_sequence() already reads zynpad's own live
+        # selected_pad fresh every time, same as every other use of it
+        # in this class.
+        delta = ccval if ccval < 64 else ccval - 128
+        if not delta:
+            return True
+        if self._is_alt:
+            new_seq = self._move_selection_row(1 if delta > 0 else -1)
+        else:
+            seq = self._get_selected_sequence()
+            new_seq = None
+            if seq is not None:
+                count = self._libseq.getSequencesInBank(self._zynseq.bank)
+                candidate = seq + (-1 if delta > 0 else 1)
+                if 0 <= candidate < count:
+                    new_seq = candidate
+        if new_seq is None:
+            return True
+        self._select_pad(new_seq)
+        self._on_selection_changed(new_seq)
+        return True
 
 
 # zynseq keymaps live here on a real box (see zynthian_gui_patterneditor.py's
@@ -5322,10 +5500,11 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             self._zynpad_handler.set_alt(self._is_alt)
         elif handler is self._play_handler:
             self._play_handler.set_alt(self._is_alt)
-        # set_active() is a no-op for most handlers - the exceptions being
-        # PlayHandler (stops any still-sounding notes on the way out) and
-        # StepSeqHandler (starts/stops its playhead poll timer) - harmless
-        # to call unconditionally on both ends of the switch either way.
+        # set_active() is a no-op for Mixer/ZynpadHandler - PlayHandler
+        # (stops any still-sounding notes on the way out) and
+        # StepSeqHandler (starts/stops its playhead poll timer) are the
+        # exceptions - harmless to call unconditionally on both ends of
+        # the switch either way.
         old_handler.set_active(False)
         handler.set_active(True)
         # Unconditional full clear rather than each handler tracking which
