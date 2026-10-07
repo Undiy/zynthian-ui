@@ -306,6 +306,59 @@ def _format_balance(balance):
     return f"Balance: {round(balance * 100)}%"
 
 
+# Velocity -> pad color (blue = quiet, red = loud), used by StepSeqHandler's
+# own _paint_pad. Tuned live against a real Fire (not just eyeballed from a
+# PNG preview) via a standalone script talking straight to the device's own
+# USB MIDI port (same SysEx format as PadLEDs, bypassing lib_zyncore/
+# zynthian entirely) - see the plan doc for the back-and-forth. Shape: red
+# stays low through most of the range then ramps up past a knee (a soft,
+# sigmoid bend, not a hard corner) around VELOCITY_COLOR_KNEE; blue starts
+# at max and fades out continuously, independent of red (not literally
+# "90 - red" - found on hardware that coupling them made the midrange look
+# brighter than either endpoint, since both channels would be boosted
+# there at once) and a little faster than a plain linear fade
+# (VELOCITY_COLOR_BLUE_GAMMA > 1).
+VELOCITY_COLOR_KNEE = 75
+VELOCITY_COLOR_STEEPNESS = 10
+VELOCITY_COLOR_RED_OFFSET = 30
+VELOCITY_COLOR_BLUE_GAMMA = 1.3
+VELOCITY_COLOR_PEAK = 90  # matches this driver's usual "lit" brightness elsewhere
+
+
+def _velocity_color(velocity):
+    """MIDI velocity (1-127) -> (r, 0, b) - see the constants above."""
+    t = (velocity - 1) / 126.0
+    t_knee = (VELOCITY_COLOR_KNEE - 1) / 126.0
+
+    def sigmoid(x):
+        return 1 / (1 + math.exp(-VELOCITY_COLOR_STEEPNESS * (x - t_knee)))
+
+    # Normalized so t=1 always reaches exactly VELOCITY_COLOR_PEAK before
+    # the offset - a raw sigmoid only approaches its asymptote, never
+    # quite reaching it.
+    f = sigmoid(t) / sigmoid(1)
+    r = max(0, round(VELOCITY_COLOR_PEAK * f) - VELOCITY_COLOR_RED_OFFSET)
+    b = round(VELOCITY_COLOR_PEAK * ((1 - t) ** VELOCITY_COLOR_BLUE_GAMMA))
+    return (r, 0, b)
+
+
+# "Special" notes (non-default stutter/chance, see StepSeqHandler's own
+# _paint_pad) tint the same velocity color instead of replacing it
+# outright - green boosted (same idiom as the playhead's own boost, see
+# PLAYHEAD_GREEN_BOOST) and blue cut back a little, so the tint reads
+# clearly as "flagged" even at the low (blue-heavy) end of the velocity
+# range instead of blending into it - confirmed live on hardware this is
+# needed; the green boost alone wasn't quite enough to separate the two
+# at low velocities.
+SPECIAL_GREEN_BOOST = 30
+SPECIAL_BLUE_CUT = 15
+
+
+def _special_tint(color):
+    r, g, b = color
+    return (r, min(127, g + SPECIAL_GREEN_BOOST), max(0, b - SPECIAL_BLUE_CUT))
+
+
 def _alt_mode():
     """Zynthian's persistent, global "alt mode" toggle (Bank/Mode button /
     TOGGLE_ALT_MODE CUIA, see zyngui/zynthian_gui.py's alt_mode attribute) -
@@ -639,10 +692,14 @@ def _select_knob_arrow(state_manager, ccval, is_alt=False):
     default list-navigation any mode falls back to when it has no more
     specific use for the Select knob - called from the top-level driver's
     own _default_cc_change, same shared-fallback story as ZynpotRotate
-    above. Mixer/StepSeq/Play all keep their own specialized use of Select
-    instead (chain-scroll, pitch-adjust, octave-shift respectively - see
-    each one's own cc_change) and never reach this. Select's own encoder
-    isn't noisy like the other 4, so no jitter filter here either."""
+    above. Mixer/Play keep their own specialized use of Select instead
+    (chain-scroll, octave-shift respectively - see each one's own
+    cc_change) and never reach this. StepSeq only reaches this when NOT
+    Shift+Select (transpose, its own specialized use, takes priority -
+    see its own cc_change) - plain/Alt+Select there falls through to this
+    same default, same as every other screen with nothing more specific
+    for a given knob. Select's own encoder isn't noisy like the other 4,
+    so no jitter filter here either."""
     delta = ccval if ccval < 64 else ccval - 128
     if is_alt:
         state_manager.send_cuia("ARROW_RIGHT" if delta > 0 else "ARROW_LEFT")
@@ -1812,32 +1869,96 @@ ZYNSEQ_CONFIG_ROOT = "/zynthian/zynthian-data/zynseq"
 # same way zynthian_gui_patterneditor.py's load_keymap() does - chromatic, or
 # a scales.json scale relative to the pattern's tonic; only 4 rows visible at
 # once, BTN_PAT_UP/DOWN scroll the window), col=step (only 16 visible at
-# once, Grid Left/Right page through the pattern). A pad press is a 4-way
-# gesture (see _on_grid_press/_on_grid_release): plain tap toggles the note;
-# holding past the long-press threshold toggles it in/out of
-# self._selected_notes (a purely local, UI-side "selection" - zynseq has no
-# such concept); pressing a second pad in the same row while the first is
-# still held is read as an extend-duration drag, matching the touchscreen's
-# own drag convention (duration = distance between the two steps). Knobs
-# then edit whatever's selected (or the last-tapped note, if selection is
-# empty) - see cc_change(). Play/Stop need no special-casing here: the
-# existing global TOGGLE_PLAY/STOP CUIAs already target this pattern's own
-# sequence whenever the "pattern_editor" screen is showing (see
-# zynthian_gui.cuia_toggle_audio_play/cuia_stop_audio_play), which is exactly
-# the screen this mode is active on.
+# once, Grid Left/Right page through the pattern). What a pad press does
+# depends entirely on selection mode (Solo1, see note_on/
+# _toggle_select_mode): mode off, plain tap adds/removes a note, and a
+# second pad in the same row while the first is still held is read as an
+# extend-duration drag (matching the touchscreen's own drag convention -
+# duration = distance between the two steps); mode on, pads never touch
+# the pattern at all - a tap only toggles that note in/out of
+# self._selected_notes (a purely local, UI-side "selection" - zynseq has
+# no such concept) instead, and the same 2-pad chord gesture selects every
+# existing note between the two instead of extending one (see
+# _on_grid_press/_on_grid_release/_select_range). Alt+Solo1 selects
+# without needing a tap at all - a progressive select-all, see
+# _select_all. The 4 channel-strip knobs edit whatever's selected while
+# selection mode is on (or the last-tapped note, if selection is empty) -
+# see cc_change(); while it's off, there's no existing note to apply to,
+# so they instead adjust sticky "next note" defaults (self._default_
+# velocity/duration/stutter_count/stutter_dur/chance/offset - see
+# _adjust_default_velocity/etc.) that _toggle_note's own add branch
+# applies to each newly added note - velocity in particular used to
+# always be a fixed 100 regardless, which is what prompted this.
+# Shift+Filter is Chance instead of Stutter count, Shift+Resonance is
+# Offset (micro-timing) instead of Stutter duration - Shift+Volume/Pan
+# are left doing the same thing as unshifted for now (Velocity/Duration).
+# Select itself only transposes while Shift is held (Shift+Select, see
+# cc_change/_adjust_pitch) - plain/Alt+Select fall through to the shared
+# default (list navigation) instead, same as any screen with nothing more
+# specific for a given knob. Solo2/Alt+Solo2 arm copy/cut, but only while
+# selection mode is on (see note_on/_toggle_clip_mode) - plain Solo2
+# toggles Mute instead the rest of the time, same as before this
+# existed. A subsequent pad press pastes the armed selection there
+# (_paste_clip), carrying every property (velocity/duration/offset/
+# stutter/chance) just like Shift+Select's own transpose does. Solo4/
+# Alt+Solo4 are Undo/Redo (_undo/_redo, libseq's own real multi-level
+# snapshot stack - see the plan doc) - reachable without holding any
+# modifier first, unlike Select/Solo1/Solo2's own editing tools, since
+# you might want to undo whatever you were just doing with one of those.
+# Shift+Solo4 toggles Quantize instead (moved off plain Solo4 to make
+# room for this).
+# Play/Stop need no special-casing here: the existing global
+# TOGGLE_PLAY/STOP CUIAs already target this pattern's own sequence
+# whenever the "pattern_editor" screen is showing (see
+# zynthian_gui.cuia_toggle_audio_play/cuia_stop_audio_play), which is
+# exactly the screen this mode is active on.
 class StepSeqHandler(ModeHandlerBase):
 
+    # Baseline values for a newly added note - overridden per-session by
+    # self._default_velocity/etc. (see __init__), adjustable via the 4
+    # channel-strip knobs while selection mode is off (see cc_change) -
+    # these constants are only ever read once, at construction.
     DEFAULT_VELOCITY = 100
     DEFAULT_DURATION = 1
+    DEFAULT_STUTTER_COUNT = 0
+    DEFAULT_STUTTER_DUR = 1
+    DEFAULT_CHANCE = 100
+    DEFAULT_OFFSET = 0  # percent (0-99), see _adjust_offset's own comment
+
+    # Default row view on a fresh activation (_load_keymap's own "fresh"
+    # branch) - plain MIDI note numbers, not names, since this driver's own
+    # scientific-pitch _note_name() (C4=60) and the Ableton/Logic-style
+    # naming most drum literature actually uses (C3=60, so GM's Kick/Bass
+    # Drum 1 at note 36 reads as "C1") disagree by a whole octave, and the
+    # note is what actually matters here, not what either convention
+    # happens to call it. DEFAULT_VIEW_ANCHOR (49) is one octave (and one
+    # extra semitone, nudged up after live testing) below the original
+    # middle-C (60) default - still "show me pitches", just centered
+    # lower, a plain preference, nothing to do with drum detection.
+    # DRUM_VIEW_ANCHOR (37) is PlayHandler's own BASE_NOTE_DEFAULT (36,
+    # GM's Kick/Bass Drum 1) plus that same +1 nudge - see
+    # _is_drum_pattern.
+    DEFAULT_VIEW_ANCHOR = 49
+    DRUM_VIEW_ANCHOR = 37
 
     # Note cell colors: full at a note's start step, dimmer across the rest
-    # of its sustain (its "tail") - selected notes get the plan's dark-yellow
-    # overlay instead of the normal teal, at both brightness levels.
+    # of its sustain (its "tail") - a note's own color is normally the
+    # module-level velocity gradient (_velocity_color, see its own
+    # comment) - tinted via _special_tint for a non-default stutter/
+    # chance - but a selected note overrides both entirely with a plain,
+    # fixed highlight instead (yellow) regardless of velocity/special
+    # status: selecting and reading a note's own properties are different
+    # things you rarely need at the same glance, and yellow reads as
+    # clearly distinct from the gradient (which only ever runs blue to
+    # red) as from the special tint's own green - confirmed live on
+    # hardware this also stays clear of the playhead's own green boost
+    # (unlike a plain green highlight would have, see PLAYHEAD_GREEN_BOOST
+    # below), so a selected note crossing the playhead doesn't get
+    # ambiguous either.
     COLOR_EMPTY = (0, 0, 0)
-    COLOR_NOTE = (0, 60, 60)
-    COLOR_NOTE_TAIL = (0, 20, 20)
     COLOR_SELECTED = (70, 60, 0)
     COLOR_SELECTED_TAIL = (35, 30, 0)
+    NOTE_TAIL_RATIO = 1 / 3  # matches the old COLOR_NOTE_TAIL/COLOR_NOTE ratio
 
     # Playhead cursor: an otherwise-empty cell at the current step gets a dim
     # green tint (rather than staying black) so the column reads as "the
@@ -1850,16 +1971,16 @@ class StepSeqHandler(ModeHandlerBase):
 
     # Tonic guidance line: every row whose note is the pattern's root note
     # (note%12 == getTonic(), see _load_keymap/_paint_pad) gets a dim white
-    # tint spanning the whole row, empty cells included - a constant visual
-    # reference for "where the root note is" while scrolling, in Chromatic
-    # too (not just an active scale - the tonic field means something
-    # either way, see _adjust_tonic). Additive on top of whatever else the
-    # cell would show (note/tail/selected/playhead), not a replacement, so
-    # it reads as a guide line rather than hiding other state; a small dim
-    # white boost stays visibly distinct from the playhead's green and the
-    # selection's yellow regardless of which of those the row also has.
+    # tint on its otherwise-empty cells only - a constant visual reference
+    # for "where the root note is" while scrolling, in Chromatic too (not
+    # just an active scale - the tonic field means something either way,
+    # see _adjust_tonic) - without altering an actual note's own color/
+    # brightness on that row (deliberately NOT additive on top of a note
+    # cell, unlike the playhead's own green boost - found on hardware
+    # that boosting a note's own color here read as the guide line
+    # fighting with the note's own velocity/selection coloring, not
+    # reinforcing it).
     COLOR_TONIC_EMPTY = (18, 18, 18)
-    TONIC_ROW_BOOST = 18
 
     def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs, oled_refresh_cb=None):
         super().__init__(state_manager)
@@ -1869,6 +1990,53 @@ class StepSeqHandler(ModeHandlerBase):
         self._libseq = self._zynseq.libseq
         self._knobs_ease = KnobJitterFilter()
         self._is_alt = False
+
+        # Which of the 4 channel-strip knobs have had a real (non-jitter-
+        # filtered) edit during the CURRENT touch session, still unsaved
+        # as its own undo snapshot - see cc_change/note_off. Saved on
+        # RELEASE, not on touch: savePatternSnapshot() captures whatever
+        # is live at the exact moment it's called, and undo()/redo() can
+        # only ever land on states that actually got captured - found on
+        # hardware that snapshotting before each edit instead made the
+        # first Undo jump back TWO edits at once (undo() decrements its
+        # position *then* restores, so it needs to already be pointing
+        # at a snapshot of the live state as it is *right now*, not as it
+        # was before the most recent edit) and made Redo unable to ever
+        # reach the very last edit at all (its own "after" state was
+        # never its own snapshot to begin with). One snapshot per
+        # touch-and-turn *session* (on release), not per tick - otherwise
+        # a long spin would need just as many Undo presses to back out
+        # of. Shift+Select's own pitch transpose doesn't need this
+        # session batching - see _adjust_pitch's own comment on why.
+        self._knob_dirty = set()
+        # Cumulative requested delta since the knob was last touched (reset
+        # in note_on's ZYNPOT_KNOBS branch, accumulated in cc_change) - the
+        # relative toast shown once more than one note is targeted
+        # (_show_edit) uses this instead of the current tick's own +-1, so
+        # a long turn reads as "the whole turn so far" rather than
+        # flashing "+1"/"-1" over and over.
+        self._knob_total_delta = {}
+
+        # Sticky "next note" defaults - the 4 channel-strip knobs adjust
+        # these instead of an existing note's own properties while
+        # selection mode is off (see cc_change); _toggle_note's own add
+        # branch applies whatever they currently are to each new note.
+        # Deliberately NOT reset in refresh() (unlike _select_mode/
+        # _clip_mode/etc.) - these are a performance preference worth
+        # keeping exactly as dialed in across pattern switches/mode
+        # re-entries, same reasoning PlayHandler's own scale/tonic
+        # already uses for not resetting on every activation. No reset
+        # gesture - Alt+touch collides with the same global "zynpot
+        # switch" gesture Chance's own Alt+Filter used to (see the plan
+        # doc), and Shift+touch would collide with Shift+Filter's own
+        # "adjust default chance" meaning below - user preferred just
+        # dialing a knob back down by hand over either workaround.
+        self._default_velocity = self.DEFAULT_VELOCITY
+        self._default_duration = self.DEFAULT_DURATION
+        self._default_stutter_count = self.DEFAULT_STUTTER_COUNT
+        self._default_stutter_dur = self.DEFAULT_STUTTER_DUR
+        self._default_chance = self.DEFAULT_CHANCE
+        self._default_offset = self.DEFAULT_OFFSET
 
         # Live parameter-value readout (Velocity/Duration/Stutter/Chance/
         # Pitch, see cc_change) while a knob is actually changing one -
@@ -1894,11 +2062,46 @@ class StepSeqHandler(ModeHandlerBase):
         self._selected_notes = set()
         self._last_note = None
 
-        # Pads currently physically held, note -> (row, col, step, note_val,
-        # press_ts) - used to tell a plain tap from a long-press (on release,
-        # by elapsed time) and to detect the second-pad-of-an-extend-gesture
-        # case (see _on_grid_press). A pad popped from here by that gesture
-        # is "consumed" - its own eventual release finds nothing and no-ops,
+        # Selection mode (Solo1, see note_on/_toggle_select_mode) - sticky,
+        # like Shift: while on, pads only toggle selection on existing
+        # notes (no add/remove/extend - see _on_grid_press/_on_grid_release)
+        # - a dedicated mode rather than overloading tap-vs-long-press like
+        # this used to, so a quick tap can never land on the wrong one.
+        self._select_mode = False
+        # Alt+Solo1's own progressive select-all level - None (nothing
+        # select-all'd, or the selection has since been changed by hand -
+        # see _reset_select_all_level), 0 (just the visible 4-row window)
+        # or 1 (every row on the current page) - see _select_all. Purely a
+        # UI/LED concept (drives LED_SOLO_1's own strip, see _update_leds)
+        # - _selected_notes itself is the only real state.
+        self._select_all_level = None
+
+        # Clip mode (Solo2/Alt+Solo2, see note_on/_toggle_clip_mode) -
+        # None/"copy"/"cut". Only meaningful while selection mode is on
+        # (copy/paste needs a selection to begin with) - Solo2 falls back
+        # to its usual "toggle mute" job otherwise, see note_on, and
+        # leaving selection mode disarms whatever was armed (see
+        # _toggle_select_mode). _clip_notes: snapshot of _selected_notes'
+        # full properties taken at arm time (step, note_val, velocity,
+        # duration, offset, stutter_count, stutter_dur, chance) - frozen
+        # for "copy" (each paste re-stamps the same originals), but
+        # updated in place after every "cut" paste to the notes' new
+        # positions (see _paste_clip) - cut genuinely relocates the same
+        # notes paste after paste, never leaving copies behind at earlier
+        # destinations, rather than only actually moving once and
+        # silently turning into copies after that. _clip_anchor: the
+        # earliest (step, note_val) among them - whichever pad you push
+        # becomes ITS new position, every other note moves by the same
+        # (row, step) delta - see _paste_clip.
+        self._clip_mode = None
+        self._clip_notes = []
+        self._clip_anchor = None
+
+        # Pads currently physically held, note -> (row, col, step,
+        # note_val) - detects the second-pad-of-a-chord-gesture case (see
+        # _on_grid_press: extend-duration normally, range-select while
+        # _select_mode is on). A pad popped from here by that gesture is
+        # "consumed" - its own eventual release finds nothing and no-ops,
         # same idea as DrivenByMoss's button.setConsumed().
         self._held = {}
 
@@ -1939,6 +2142,48 @@ class StepSeqHandler(ModeHandlerBase):
     # ----------------------------------------------------------------------
     # Keymap / view
     # ----------------------------------------------------------------------
+    def _is_drum_pattern(self):
+        """Best-effort "is this pattern's own chain using a drum-kit
+        preset" - there's no first-class is_drum flag anywhere in
+        zynthian, so this mirrors the exact heuristic
+        zynthian_gui_patterneditor.py's own get_custom_keymap() uses to
+        decide whether to show a named per-note keymap at all: a
+        pattern's Scale==0 is reserved for "Custom" (distinct from 1=
+        Chromatic, 2+=a scales.json entry); when set, the touchscreen
+        looks up the pattern's own chain's synth processor's current
+        preset path against keymaps.json (a table of path-substring ->
+        .midnam keymap filename) and, on a match, loads that file's named
+        note map. We don't load the actual .midnam (full custom keymaps
+        are still out of scope, see this method's own caller's
+        docstring) - just enough of the same lookup to answer the
+        boolean, used to pick DRUM_VIEW_ANCHOR over DEFAULT_VIEW_ANCHOR.
+        Not a guaranteed semantic - a non-drum instrument with a named
+        keymap would also read as "drum" here - but it's the closest
+        thing that exists, and in practice a named per-note keymap is
+        almost always a drum kit."""
+        if self._libseq.getScale() != 0:
+            return False
+        seq = self._get_selected_sequence()
+        if seq is None:
+            return False
+        channel = self._libseq.getChannel(self._zynseq.bank, seq, 0)
+        processor = self._chain_manager.get_synth_processor(channel)
+        if processor is None:
+            return False
+        try:
+            preset_path = processor.get_presetpath()
+        except Exception:
+            return False
+        if not preset_path:
+            return False
+        try:
+            with open(ZYNSEQ_CONFIG_ROOT + "/keymaps.json") as f:
+                keymaps = json.load(f)
+        except Exception as ex:
+            logging.warning(f"StepSeqHandler: can't load keymaps.json => {ex}")
+            return False
+        return any(pat in preset_path for pat in keymaps)
+
     def _load_keymap(self, recenter=True):
         """Rebuild self._keymap from the current pattern's scale/tonic,
         mirroring zynthian_gui_patterneditor.py's load_keymap() (chromatic,
@@ -1954,7 +2199,8 @@ class StepSeqHandler(ModeHandlerBase):
         for the Fire to keep a second copy of it.
 
         recenter=True (refresh() - a new pattern/mode activation) re-centers
-        the row view on middle C, same as before. recenter=False
+        the row view on DEFAULT_VIEW_ANCHOR, or DRUM_VIEW_ANCHOR instead
+        once _is_drum_pattern() says so (see its own comment). recenter=False
         (_on_scale_changed() - still the same pattern, just its scale/tonic
         changed) instead keeps showing roughly the same pitch range: the
         view re-anchors on self._anchor_note (its nearest match, since the
@@ -2006,10 +2252,11 @@ class StepSeqHandler(ModeHandlerBase):
 
         fresh = recenter or self._anchor_note is None
         if fresh:
-            # -1: land one row below the first note >= middle C, not right
-            # on it - same visual framing as before this method grew the
+            target = self.DRUM_VIEW_ANCHOR if self._is_drum_pattern() else self.DEFAULT_VIEW_ANCHOR
+            # -1: land one row below the first note >= target, not right on
+            # it - same visual framing as before this method grew the
             # anchor-based branch below.
-            idx = next((i for i, e in enumerate(keymap) if e["note"] >= 60), 0) - 1
+            idx = next((i for i, e in enumerate(keymap) if e["note"] >= target), 0) - 1
         else:
             # No -1 here (unlike above) - idx already IS the row to land
             # on: self._anchor_note's own new position, not a fresh
@@ -2050,35 +2297,50 @@ class StepSeqHandler(ModeHandlerBase):
     def _on_scale_changed(self):
         self._load_keymap(recenter=False)
         self._paint_all()
+        # Toast names the new scale/tonic itself (e.g. 'C Major',
+        # 'Chromatic') - the static line (oled_status's own fallback,
+        # _view_range_text) already tracks the view's note range live on
+        # its own, every call, so no separate toast is needed for that.
+        self._oled_value.show(self._scale_label)
         if self._oled_refresh_cb:
             self._oled_refresh_cb()
+
+    def _view_range_text(self):
+        """Note range the 4 currently visible rows correspond to, e.g.
+        'C3-A3' - the OLED equivalent of DrivenByMoss's own
+        Scales.getSequencerRangeText() for its Note Sequencer view,
+        except shown as the static line (oled_status's own fallback)
+        rather than a one-shot toast, since it's cheap to recompute
+        fresh on every call and so never goes stale. Low is
+        self._row_offset itself (physical row 3, bottom); high is 3
+        rows up (physical row 0, top) - same indexing _keymap_index()
+        uses, clamped in case a scale somehow has fewer than 4 degrees
+        in view."""
+        low = self._keymap[self._row_offset]["note"]
+        high = self._keymap[min(self._row_offset + 3, len(self._keymap) - 1)]["note"]
+        return f"{_note_name(low)}-{_note_name(high)}"
 
     def oled_status(self):
         """Secondary OLED line while StepSeq is active (see the top-level
         driver's _refresh_oled) - the transient Velocity/Duration/Stutter/
-        Chance/Pitch readout from cc_change (see self._oled_value) takes
-        priority for a couple seconds after a knob turn; otherwise the
-        current pattern's scale/tonic, e.g. 'C Major', or 'Chromatic'."""
-        return self._oled_value.text or self._scale_label
+        Chance/Offset/Pitch readout from cc_change (an existing note's own
+        properties while selection mode is on, the sticky "next note"
+        defaults otherwise - see _adjust_default_velocity/etc.), or a
+        selection/clip/undo/scale toast (see _toggle_select_mode/
+        _select_all/_show_select_count/_toggle_clip_mode/_disarm_clip/
+        _paste_clip/_undo/_redo/_on_scale_changed, all sharing the same
+        self._oled_value) takes priority for a couple seconds after a
+        knob turn or a selection/clipboard/undo/scale change; otherwise
+        the current view's own note range, live (_view_range_text, e.g.
+        'C3-A3') - not the scale name, which only ever shows as the
+        toast above, on an actual scale/tonic change."""
+        return self._oled_value.text or self._view_range_text()
 
     def _keymap_index(self, phys_row):
         """Physical pad row (0=top) -> index into self._keymap, or None if
         that row is past either edge of the keymap right now."""
         idx = self._row_offset + (3 - phys_row)
         return idx if 0 <= idx < len(self._keymap) else None
-
-    def _pad_for(self, step, note_val):
-        """Inverse lookup: (step, note) -> (phys_row, phys_col) if currently
-        visible, else None. Linear scan over the keymap - fine at
-        button-press rates, not called anywhere hot."""
-        col = step - self._step_page * 16
-        if not (0 <= col < 16):
-            return None
-        idx = next((i for i, e in enumerate(self._keymap) if e["note"] == note_val), None)
-        if idx is None:
-            return None
-        row = self._row_offset + 3 - idx
-        return (row, col) if 0 <= row < 4 else None
 
     def _page_steps(self, direction):
         # getSteps() read fresh, not cached - see refresh()'s own comment on
@@ -2153,6 +2415,17 @@ class StepSeqHandler(ModeHandlerBase):
         self._row_offset = max(0, min(self._row_offset + direction * amount, max_offset))
         self._anchor_note = self._keymap[self._row_offset]["note"]
         self._paint_all()
+        # oled_status()'s own _view_range_text() already reflects the new
+        # row_offset the moment it's next called - but nothing calls it on
+        # its own; _refresh_oled (the top-level driver) only ever runs on
+        # an explicit push, same as every other handler-driven OLED
+        # update (see _on_scale_changed/_adjust_pitch/etc.), so without
+        # this the status line just sits stale (still showing the range
+        # from before the scroll) until some unrelated event happens to
+        # trigger a redraw - found on hardware, a real bug, not just a
+        # cosmetic nice-to-have.
+        if self._oled_refresh_cb:
+            self._oled_refresh_cb()
 
     # ----------------------------------------------------------------------
     # Painting
@@ -2178,6 +2451,13 @@ class StepSeqHandler(ModeHandlerBase):
         self._step_page = 0
         self._selected_notes = set()
         self._last_note = None
+        self._select_mode = False
+        self._select_all_level = None
+        self._clip_mode = None
+        self._clip_notes = []
+        self._clip_anchor = None
+        self._knob_dirty = set()
+        self._knob_total_delta = {}
         self._held = {}
         self._playhead_step = None
         # self._is_shifted is otherwise only kept in sync inside note_on
@@ -2187,6 +2467,12 @@ class StepSeqHandler(ModeHandlerBase):
         # this handler's own copy was last left at (stale, or still the
         # __init__ default) before any note_on happens to run.
         self._is_shifted = _alt_mode()
+        # Baseline checkpoint for whatever the pattern looks like right
+        # now, on entry/reload - every _toggle_note/etc. snapshot below
+        # captures the state right *after* its own edit (see their own
+        # comments), so without this the very first edit made here would
+        # have no earlier, valid checkpoint to undo back to.
+        self._libseq.savePatternSnapshot()
         self._paint_all()
         self._update_leds()
         self._paint_grid_leds()
@@ -2241,34 +2527,55 @@ class StepSeqHandler(ModeHandlerBase):
             self._pads.set_pad(note_pad, *color)
             return
         selected = (start, note_val) in self._selected_notes
-        if step == start:
-            color = self.COLOR_SELECTED if selected else self.COLOR_NOTE
+        if selected:
+            # Fixed highlight, ignores velocity/special entirely - see the
+            # class comment above COLOR_SELECTED for why.
+            color = self.COLOR_SELECTED if step == start else self.COLOR_SELECTED_TAIL
         else:
-            color = self.COLOR_SELECTED_TAIL if selected else self.COLOR_NOTE_TAIL
+            color = _velocity_color(self._libseq.getNoteVelocity(start, note_val))
+            if (self._libseq.getStutterCount(start, note_val) > 0
+                    or self._libseq.getNotePlayChance(start, note_val) < 100):
+                color = _special_tint(color)
+            if step != start:
+                color = tuple(round(c * self.NOTE_TAIL_RATIO) for c in color)
         if on_playhead:
             r, g, b = color
             color = (r, min(127, g + self.PLAYHEAD_GREEN_BOOST), b)
-        if is_tonic_row:
-            r, g, b = color
-            boost = self.TONIC_ROW_BOOST
-            color = (min(127, r + boost), min(127, g + boost), min(127, b + boost))
+        # Deliberately no tonic-row boost here (unlike the empty-cell
+        # branch above) - it's meant as a guide line for otherwise-empty
+        # cells only, not a tint on an actual note's own color/brightness.
         self._pads.set_pad(note_pad, *color)
 
-    def _paint_pad_at(self, step, note_val):
-        pos = self._pad_for(step, note_val)
-        if pos is not None:
-            self._paint_pad(*pos)
-
     def _update_leds(self):
-        # Solo1 (Stop) is a momentary action with no state, so no LED for it.
-        # Solo2/3 (mute/solo) match MixerHandler's own red/mute vs
-        # green/solo split (see its _paint_solo_led) instead of both being
-        # plain green - Solo4 (quantize) is unrelated to mute/solo, stays
-        # green as its own simple on/off.
-        self._leds.led_off(LED_SOLO_1)
+        # Solo1's strip shows Alt+Solo1's own progressive select-all level
+        # (see _select_all/_reset_select_all_level) - green for "visible",
+        # red for "page", off once nothing select-all'd (including after
+        # any manual selection change, which resets the level - a plain
+        # tap/range-select no longer matches what select-all last did).
+        # Solo3 (solo) matches MixerHandler's own green/solo split (see its
+        # _paint_solo_led) - Solo4 (quantize) is unrelated, stays green as
+        # its own simple on/off. Solo2's strip shows mute (red, same as
+        # Solo3's own red/green split) while selection mode is off - its
+        # usual job there (see note_on) - or, while selection mode is on,
+        # which clip mode is armed instead (see _toggle_clip_mode): green
+        # for "copy", red for "cut".
+        if self._select_all_level == 0:
+            self._leds.led_on(LED_SOLO_1, LED_RG_HIGH_GREEN)
+        elif self._select_all_level == 1:
+            self._leds.led_on(LED_SOLO_1, LED_RG_HIGH_RED)
+        else:
+            self._leds.led_off(LED_SOLO_1)
         chain = self._get_chain()
-        self._leds.led_on(LED_SOLO_2, LED_RG_HIGH_RED) if chain is not None and self._zynmixer.get_mute(chain.mixer_chan) \
-            else self._leds.led_off(LED_SOLO_2)
+        if self._select_mode:
+            if self._clip_mode == "copy":
+                self._leds.led_on(LED_SOLO_2, LED_RG_HIGH_GREEN)
+            elif self._clip_mode == "cut":
+                self._leds.led_on(LED_SOLO_2, LED_RG_HIGH_RED)
+            else:
+                self._leds.led_off(LED_SOLO_2)
+        else:
+            self._leds.led_on(LED_SOLO_2, LED_RG_HIGH_RED) if chain is not None and self._zynmixer.get_mute(chain.mixer_chan) \
+                else self._leds.led_off(LED_SOLO_2)
         self._leds.led_on(LED_SOLO_3, LED_RG_HIGH_GREEN) if chain is not None and self._zynmixer.get_solo(chain.mixer_chan) \
             else self._leds.led_off(LED_SOLO_3)
         self._leds.led_on(LED_SOLO_4, LED_RG_HIGH_GREEN) if self._libseq.getQuantizeNotes() \
@@ -2277,8 +2584,15 @@ class StepSeqHandler(ModeHandlerBase):
         # Mixer-only, "which of 4 visible chains is selected" thing - see
         # MixerHandler._paint_solo_led) - explicitly set to a static dim
         # green idle glow rather than leaving them at whatever Mixer/etc.
-        # last left them (stale, misleading).
-        for led in (LED_SOLO_1_BTN, LED_SOLO_2_BTN, LED_SOLO_3_BTN, LED_SOLO_4_BTN):
+        # last left them (stale, misleading). Solo1/Solo2's own caps are
+        # the exception - each is its own mode's on/off indicator (see
+        # _toggle_select_mode/_toggle_clip_mode), bright instead of dim
+        # while active - Solo2's own only while selection mode is actually
+        # on too (clip mode can't even be armed otherwise, see note_on).
+        self._leds.led_on(LED_SOLO_1_BTN, LED_GREEN_HIGH if self._select_mode else LED_GREEN_DULL)
+        self._leds.led_on(LED_SOLO_2_BTN,
+                           LED_GREEN_HIGH if self._select_mode and self._clip_mode is not None else LED_GREEN_DULL)
+        for led in (LED_SOLO_3_BTN, LED_SOLO_4_BTN):
             self._leds.led_on(led, LED_GREEN_DULL)
 
     # ----------------------------------------------------------------------
@@ -2293,28 +2607,46 @@ class StepSeqHandler(ModeHandlerBase):
             return True
         note_val = self._keymap[krow]["note"]
 
-        # A second pad in the same row, pressed while another is still held,
-        # is the extend-duration gesture - consumes both (see class comment).
-        other = next((n for n, info in self._held.items() if info[0] == row and n != note), None)
-        if other is not None:
-            self._extend_duration(self._held.pop(other), step, note_val)
+        # While a clip is armed (Solo2/Alt+Solo2, see note_on/
+        # _toggle_clip_mode), any pad press is purely "paste it here" -
+        # takes priority over everything else below (selection
+        # mode/extend-duration), never added to self._held at all (a
+        # discrete one-shot action, not a hold/release gesture - its own
+        # eventual release finds nothing in _held and no-ops).
+        if self._clip_mode is not None:
+            self._paste_clip(krow, step)
             return True
 
-        self._held[note] = (row, col, step, note_val, time.time())
+        # A second pad in the same row, pressed while another is still
+        # held, is a 2-pad chord gesture - consumes both (see class
+        # comment): extend-duration normally, or range-select (select
+        # every existing note between the two, same row - see
+        # _select_range) while selection mode is on, since that mode
+        # never mutates the pattern itself (see _toggle_select_mode).
+        other = next((n for n, info in self._held.items() if info[0] == row and n != note), None)
+        if other is not None:
+            other_info = self._held.pop(other)
+            if self._select_mode:
+                self._select_range(other_info, step, note_val)
+            else:
+                self._extend_duration(other_info, step, note_val)
+            return True
+
+        self._held[note] = (row, col, step, note_val)
         return True
 
     def _on_grid_release(self, note):
         info = self._held.pop(note, None)
         if info is None:
-            return  # consumed by an extend-duration gesture already
-        _, _, step, note_val, ts = info
-        if time.time() - ts >= CONST.PT_LONG_TIME:
+            return  # consumed by a 2-pad chord gesture already
+        _, _, step, note_val = info
+        if self._select_mode:
             self._toggle_selection(step, note_val)
         else:
             self._toggle_note(step, note_val)
 
     def _extend_duration(self, start_info, end_step, note_val):
-        _, _, start_step, start_note_val, _ = start_info
+        _, _, start_step, start_note_val = start_info
         if start_note_val != note_val or start_step == end_step:
             return
         lo, hi = sorted((start_step, end_step))
@@ -2325,8 +2657,33 @@ class StepSeqHandler(ModeHandlerBase):
         # drag gesture (distance, not count), this is two discrete pad
         # presses, so "extend to this pad" reads as "cover this step too".
         self._set_note_duration(lo, note_val, hi - lo + 1)
+        self._libseq.savePatternSnapshot()
         self._paint_all()
         self._preview_note(lo, note_val)
+
+    def _select_range(self, start_info, end_step, note_val):
+        """Selection mode's own 2-pad chord gesture (see _on_grid_press) -
+        same shape as _extend_duration, but selects every *existing* note
+        between the two pads (inclusive, same row) instead of stretching
+        one - never adds/removes notes, matching selection mode's own rule.
+        Always selects (doesn't toggle each note individually) - simpler
+        and more predictable than per-note toggling, and matches how range
+        select reads in most sequencers/DAWs."""
+        _, _, start_step, start_note_val = start_info
+        if start_note_val != note_val or start_step == end_step:
+            return
+        lo, hi = sorted((start_step, end_step))
+        changed = False
+        for step in range(lo, hi + 1):
+            start = self._libseq.getNoteStart(step, note_val)
+            if start == step and (start, note_val) not in self._selected_notes:
+                self._selected_notes.add((start, note_val))
+                changed = True
+        if not changed:
+            return
+        self._reset_select_all_level()
+        self._paint_all()
+        self._show_select_count()
 
     def _step_duration_ms(self):
         """ms per pattern step at the current tempo/steps-per-beat - same
@@ -2373,23 +2730,208 @@ class StepSeqHandler(ModeHandlerBase):
             if self._last_note == (start, note_val):
                 self._last_note = None
             self._libseq.removeNote(start, note_val)
+            self._libseq.savePatternSnapshot()
             self._paint_all()
         else:
-            self._libseq.addNote(step, note_val, self.DEFAULT_VELOCITY, self.DEFAULT_DURATION, 0)
+            self._libseq.addNote(step, note_val, self._default_velocity, self._default_duration,
+                                  self._default_offset / 100.0)
+            self._libseq.setStutterCount(step, note_val, self._default_stutter_count)
+            self._libseq.setStutterDur(step, note_val, self._default_stutter_dur)
+            self._libseq.setNotePlayChance(step, note_val, self._default_chance)
+            self._libseq.savePatternSnapshot()
             self._last_note = (step, note_val)
-            self._paint_pad_at(step, note_val)
+            # Full repaint, not just this one cell - harmless back when
+            # new notes were always a fixed 1-step DEFAULT_DURATION (no
+            # tail to miss), but self._default_duration can now be >1
+            # (see _adjust_default_duration), so a freshly added note can
+            # span multiple steps whose tail cells need painting too -
+            # same bug _toggle_selection had below (and the same fix).
+            self._paint_all()
             self._preview_note(step, note_val)
 
     def _toggle_selection(self, step, note_val):
         start = self._libseq.getNoteStart(step, note_val)
         if start < 0:
-            return  # long-pressing an empty cell is a no-op
+            return  # tapping an empty cell in selection mode is a no-op
         key = (start, note_val)
         if key in self._selected_notes:
             self._selected_notes.discard(key)
         else:
             self._selected_notes.add(key)
-        self._paint_pad_at(start, note_val)
+        self._reset_select_all_level()
+        # Full repaint, not just this one cell - a note with duration > 1
+        # step has tail cells too, which would otherwise be left showing
+        # a stale, inconsistent color, since _paint_pad's own per-cell
+        # head-vs-tail coloring (see its own getNoteStart check) never
+        # gets a chance to run on them.
+        self._paint_all()
+        self._show_select_count()
+
+    # ----------------------------------------------------------------------
+    # Selection mode (Solo1/Alt+Solo1) - see note_on
+    # ----------------------------------------------------------------------
+    def _toggle_select_mode(self):
+        """Solo1 (plain) - see note_on. Clears the selection on the way
+        out (confirmed on hardware this reads better than leaving it -
+        knobs/everything else keep working the same way regardless, so
+        there's no loss other than having to re-select next time) and
+        disarms any armed clip too (copy/cut/paste only mean anything
+        with a selection to begin with, and Solo2 is about to go back to
+        meaning Mute instead - see note_on - so nothing should stay
+        silently armed in the background for the next time selection mode
+        is entered)."""
+        self._select_mode = not self._select_mode
+        if not self._select_mode:
+            self._selected_notes.clear()
+            self._select_all_level = None
+            self._clip_mode = None
+            self._clip_notes = []
+            self._clip_anchor = None
+            self._paint_all()
+        self._update_leds()
+        self._oled_value.show(f"Selection: {'On' if self._select_mode else 'Off'}")
+
+    def _reset_select_all_level(self):
+        """Any manual selection change (a single toggle, or a range-select
+        - see _toggle_selection/_select_range) invalidates Alt+Solo1's own
+        progressive level (see _select_all) - the resulting selection no
+        longer matches exactly what that select-all would have produced,
+        so its own LED indicator (see _update_leds) shouldn't keep
+        claiming it does. A no-op repaint-wise when already None."""
+        if self._select_all_level is not None:
+            self._select_all_level = None
+            self._update_leds()
+
+    def _select_all(self):
+        """Alt+Solo1 - progressive select-all: advances self._select_all_level
+        by one step (None/1 -> 0 = every note in the visible 4-row window;
+        0 -> 1 = every note on the whole current 16-step page, every row),
+        wrapping back to 0 after 1. Implicitly turns selection mode on
+        first if it wasn't already - selecting notes only means something
+        there, see _toggle_select_mode."""
+        if not self._select_mode:
+            self._select_mode = True
+            self._selected_notes.clear()
+        self._select_all_level = 0 if self._select_all_level is None or self._select_all_level == 1 else 1
+        if self._select_all_level == 0:
+            indices = [i for i in (self._keymap_index(row) for row in range(4)) if i is not None]
+        else:
+            indices = range(len(self._keymap))
+        first_step = self._step_page * 16
+        last_step = min(first_step + 16, self._libseq.getSteps())
+        for idx in indices:
+            note_val = self._keymap[idx]["note"]
+            for step in range(first_step, last_step):
+                start = self._libseq.getNoteStart(step, note_val)
+                if start == step:
+                    self._selected_notes.add((start, note_val))
+        self._paint_all()
+        self._update_leds()
+        scope = "Visible" if self._select_all_level == 0 else "Page"
+        self._oled_value.show(f"Select All: {scope} (×{len(self._selected_notes)})")
+
+    def _show_select_count(self):
+        self._oled_value.show(f"Selected: {len(self._selected_notes)}")
+
+    # ----------------------------------------------------------------------
+    # Copy/cut/paste (Solo2/Alt+Solo2) - see note_on
+    # ----------------------------------------------------------------------
+    def _toggle_clip_mode(self, mode):
+        """Solo2 (plain) arms/disarms "copy"; Alt+Solo2 arms/disarms "cut"
+        - pressing the button for whichever mode is already armed disarms
+        it, same toggle idea as _toggle_select_mode. Arming snapshots
+        _selected_notes' full properties right away (see __init__'s own
+        comment on self._clip_notes/_clip_anchor) rather than on first
+        paste - a no-op (just a toast, nothing arms) if there's nothing
+        selected to snapshot."""
+        if self._clip_mode == mode:
+            self._disarm_clip()
+            return
+        if not self._selected_notes:
+            self._oled_value.show("Nothing Selected")
+            return
+        self._clip_notes = [
+            (step, note_val,
+             self._libseq.getNoteVelocity(step, note_val),
+             self._libseq.getNoteDuration(step, note_val),
+             self._libseq.getNoteOffset(step, note_val),
+             self._libseq.getStutterCount(step, note_val),
+             self._libseq.getStutterDur(step, note_val),
+             self._libseq.getNotePlayChance(step, note_val))
+            for step, note_val in self._selected_notes
+        ]
+        self._clip_anchor = min((n[0], n[1]) for n in self._clip_notes)
+        self._clip_mode = mode
+        self._update_leds()
+        self._oled_value.show(f"{'Copy' if mode == 'copy' else 'Cut'} Armed: {len(self._clip_notes)}")
+
+    def _disarm_clip(self):
+        self._clip_mode = None
+        self._clip_notes = []
+        self._clip_anchor = None
+        self._update_leds()
+        self._oled_value.show("Clip Disarmed")
+
+    def _paste_clip(self, target_idx, target_step):
+        """A pad press while a clip is armed (see _on_grid_press) - the
+        pressed pad becomes self._clip_anchor's own new position, every
+        other captured note moves by the same (keymap row, step) delta.
+        All-or-nothing, like _adjust_pitch: if any note in the clip would
+        land outside the current keymap/pattern length, the whole paste
+        is refused rather than silently dropping just the notes that
+        don't fit. "cut" removes its own source notes every single paste
+        (not just the first) - self._clip_notes/_clip_anchor get updated
+        to the new positions afterward, so the next paste moves the same
+        notes again from where they now actually are, rather than leaving
+        a copy behind at every previous destination."""
+        note_to_idx = {e["note"]: i for i, e in enumerate(self._keymap)}
+        anchor_step, anchor_note_val = self._clip_anchor
+        anchor_idx = note_to_idx.get(anchor_note_val)
+        steps = self._libseq.getSteps()
+        if anchor_idx is None:
+            self._oled_value.show("Paste: Out Of Range")
+            return
+        delta_idx = target_idx - anchor_idx
+        delta_step = target_step - anchor_step
+
+        plan = []
+        for step, note_val, vel, dur, off, stutter_count, stutter_dur, chance in self._clip_notes:
+            idx = note_to_idx.get(note_val)
+            new_step = step + delta_step
+            if idx is None:
+                self._oled_value.show("Paste: Out Of Range")
+                return
+            new_idx = idx + delta_idx
+            if not (0 <= new_idx < len(self._keymap)) or not (0 <= new_step < steps):
+                self._oled_value.show("Paste: Out Of Range")
+                return
+            new_note_val = self._keymap[new_idx]["note"]
+            plan.append((step, note_val, new_step, new_note_val, vel, dur, off, stutter_count, stutter_dur, chance))
+
+        if self._clip_mode == "cut":
+            for step, note_val, *_ in plan:
+                self._libseq.removeNote(step, note_val)
+
+        new_selected = set()
+        new_clip_notes = []
+        for _, _, new_step, new_note_val, vel, dur, off, stutter_count, stutter_dur, chance in plan:
+            self._libseq.addNote(new_step, new_note_val, vel, dur, off)
+            self._libseq.setStutterCount(new_step, new_note_val, stutter_count)
+            self._libseq.setStutterDur(new_step, new_note_val, stutter_dur)
+            self._libseq.setNotePlayChance(new_step, new_note_val, chance)
+            new_selected.add((new_step, new_note_val))
+            new_clip_notes.append((new_step, new_note_val, vel, dur, off, stutter_count, stutter_dur, chance))
+        self._libseq.savePatternSnapshot()
+
+        if self._clip_mode == "cut":
+            self._clip_notes = new_clip_notes
+            self._clip_anchor = min((n[0], n[1]) for n in new_clip_notes)
+
+        self._selected_notes = new_selected
+        self._reset_select_all_level()
+        self._paint_all()
+        verb = "Moved" if self._clip_mode == "cut" else "Copied"
+        self._oled_value.show(f"{verb}: {len(plan)}")
 
     # ----------------------------------------------------------------------
     # Group editing - applies to _selected_notes if non-empty, else to
@@ -2400,21 +2942,33 @@ class StepSeqHandler(ModeHandlerBase):
             return set(self._selected_notes)
         return {self._last_note} if self._last_note is not None else set()
 
-    def _show_edit(self, label, unit_fmt, changed):
-        """Shared OLED readout for the 5 _adjust_* methods below - changed:
+    def _show_edit(self, label, unit_fmt, changed, total_delta=None):
+        """Shared OLED readout for the 6 _adjust_* methods below - changed:
         [(step, note_val, new_value), ...] actually written this call
         (skipping any target that turned out to be an empty cell, e.g.
-        after a delete raced a knob turn). All 5 apply the SAME delta to
+        after a delete raced a knob turn). All 6 apply the SAME delta to
         every target in _current_targets(), but each started from a
-        different absolute value, so there's no single "the" value once
-        more than one note is targeted - shows self._last_note's own
-        resulting value if it's among the changed notes (the one most
-        recently tapped/added, so probably what's being watched), else
-        the lowest (step, note_val) for determinism, with a "(xN)" suffix
-        whenever more than one note actually changed."""
+        different absolute value, so once more than one note is targeted,
+        showing any single note's resulting absolute value (as if it
+        applied to the whole group) was misleading - found on hardware
+        when the user noticed the toast's one number didn't match several
+        of the notes it was supposedly describing. So: with exactly one
+        target, show its own resulting absolute value, same as always;
+        with more than one, show the signed delta accumulated over the
+        whole touch-and-turn session instead (e.g. "+5", not one note's
+        new value, and not just this tick's own +-1 either - a long turn
+        would otherwise just flash "+1"/"-1" over and over without ever
+        conveying how far it had actually gone), with a "(xN)" suffix -
+        callers pass that running total explicitly (self._knob_total_delta,
+        accumulated in cc_change, reset on touch), since it's not
+        reconstructable from `changed` alone (a note sitting at a clamp
+        boundary may have moved by less than the rest)."""
         if not changed:
             return
         by_key = {(step, note_val): value for step, note_val, value in changed}
+        if total_delta is not None and len(by_key) > 1:
+            self._oled_value.show(f"{label}: {unit_fmt.format(f'{total_delta:+d}')} (×{len(by_key)})")
+            return
         rep_key = self._last_note if self._last_note in by_key else min(by_key)
         text = f"{label}: {unit_fmt.format(by_key[rep_key])}"
         if len(by_key) > 1:
@@ -2433,7 +2987,7 @@ class StepSeqHandler(ModeHandlerBase):
         for step, note_val, _ in changed:
             self._preview_note(step, note_val)
 
-    def _adjust_velocity(self, delta):
+    def _adjust_velocity(self, delta, total_delta=None):
         changed = []
         for step, note_val in self._current_targets():
             vel = self._libseq.getNoteVelocity(step, note_val)
@@ -2443,10 +2997,10 @@ class StepSeqHandler(ModeHandlerBase):
             self._libseq.setNoteVelocity(step, note_val, vel)
             changed.append((step, note_val, vel))
         self._paint_all()
-        self._show_edit("Velocity", "{}", changed)
+        self._show_edit("Velocity", "{}", changed, total_delta)
         self._preview_changed(changed)
 
-    def _adjust_duration(self, delta):
+    def _adjust_duration(self, delta, total_delta=None):
         changed = []
         steps = self._libseq.getSteps()
         for step, note_val in self._current_targets():
@@ -2457,10 +3011,10 @@ class StepSeqHandler(ModeHandlerBase):
             self._set_note_duration(step, note_val, dur)
             changed.append((step, note_val, dur))
         self._paint_all()
-        self._show_edit("Duration", "{} steps", changed)
+        self._show_edit("Duration", "{} steps", changed, total_delta)
         self._preview_changed(changed)
 
-    def _adjust_stutter_count(self, delta):
+    def _adjust_stutter_count(self, delta, total_delta=None):
         changed = []
         for step, note_val in self._current_targets():
             if self._libseq.getNoteDuration(step, note_val) <= 0:
@@ -2468,10 +3022,15 @@ class StepSeqHandler(ModeHandlerBase):
             val = max(0, self._libseq.getStutterCount(step, note_val) + delta)
             self._libseq.setStutterCount(step, note_val, val)
             changed.append((step, note_val, val))
-        self._show_edit("Stutter", "{}", changed)
+        # Stutter count now also drives the "special" pad tint (see
+        # _paint_pad/_special_tint - stutter_count > 0 is one of its two
+        # triggers), so this needs a repaint now too, unlike before that
+        # existed (stutter had no visual effect on the grid at all).
+        self._paint_all()
+        self._show_edit("Stutter", "{}", changed, total_delta)
         self._preview_changed(changed)
 
-    def _adjust_stutter_dur(self, delta):
+    def _adjust_stutter_dur(self, delta, total_delta=None):
         changed = []
         for step, note_val in self._current_targets():
             if self._libseq.getNoteDuration(step, note_val) <= 0:
@@ -2479,10 +3038,10 @@ class StepSeqHandler(ModeHandlerBase):
             val = max(1, self._libseq.getStutterDur(step, note_val) + delta)
             self._libseq.setStutterDur(step, note_val, val)
             changed.append((step, note_val, val))
-        self._show_edit("Stutter dur", "{}", changed)
+        self._show_edit("Stutter dur", "{}", changed, total_delta)
         self._preview_changed(changed)
 
-    def _adjust_chance(self, delta):
+    def _adjust_chance(self, delta, total_delta=None):
         changed = []
         for step, note_val in self._current_targets():
             if self._libseq.getNoteDuration(step, note_val) <= 0:
@@ -2490,15 +3049,76 @@ class StepSeqHandler(ModeHandlerBase):
             val = max(0, min(100, self._libseq.getNotePlayChance(step, note_val) + delta))
             self._libseq.setNotePlayChance(step, note_val, val)
             changed.append((step, note_val, val))
-        self._show_edit("Chance", "{}%", changed)
+        # Chance now also drives the "special" pad tint (see _paint_pad/
+        # _special_tint - chance < 100 is its other trigger) - same
+        # reasoning as _adjust_stutter_count's own repaint above.
+        self._paint_all()
+        self._show_edit("Chance", "{}%", changed, total_delta)
+
+    def _adjust_offset(self, delta, total_delta=None):
+        """Shift+Resonance (see cc_change) - micro-timing offset, 0-99% of
+        a step, same integer-percent convention
+        zynthian_gui_patterneditor.py's own offset editing uses
+        (EDIT_PARAM_OFFSET) - delta here is already in percent (±1 per
+        knob tick), libseq's own getNoteOffset/setNoteOffset store it as
+        a 0.0-0.99 float (percent / 100), same as that screen's own
+        conversion."""
+        changed = []
+        for step, note_val in self._current_targets():
+            if self._libseq.getNoteDuration(step, note_val) <= 0:
+                continue
+            val = max(0, min(99, round(100 * self._libseq.getNoteOffset(step, note_val)) + delta))
+            self._libseq.setNoteOffset(step, note_val, val / 100.0)
+            changed.append((step, note_val, val))
+        self._show_edit("Offset", "{}%", changed, total_delta)
+        self._preview_changed(changed)
+
+    # ----------------------------------------------------------------------
+    # "Next note" defaults (see cc_change) - same knobs as above, but
+    # while selection mode is off: no existing note to apply to, so these
+    # adjust self._default_* instead (applied by _toggle_note's own add
+    # branch) - a flat value, not a per-target "changed" list, so no
+    # _show_edit/_preview_changed involved, just a direct toast.
+    # ----------------------------------------------------------------------
+    def _adjust_default_velocity(self, delta):
+        self._default_velocity = max(1, min(127, self._default_velocity + delta))
+        self._oled_value.show(f"New Vel: {self._default_velocity}")
+
+    def _adjust_default_duration(self, delta):
+        steps = self._libseq.getSteps()
+        self._default_duration = max(1, min(steps, self._default_duration + delta))
+        self._oled_value.show(f"New Dur: {self._default_duration} steps")
+
+    def _adjust_default_stutter_count(self, delta):
+        self._default_stutter_count = max(0, self._default_stutter_count + delta)
+        self._oled_value.show(f"New Stutter: {self._default_stutter_count}")
+
+    def _adjust_default_stutter_dur(self, delta):
+        self._default_stutter_dur = max(1, self._default_stutter_dur + delta)
+        self._oled_value.show(f"New Stutter Dur: {self._default_stutter_dur}")
+
+    def _adjust_default_chance(self, delta):
+        self._default_chance = max(0, min(100, self._default_chance + delta))
+        self._oled_value.show(f"New Chance: {self._default_chance}%")
+
+    def _adjust_default_offset(self, delta):
+        self._default_offset = max(0, min(99, self._default_offset + delta))
+        self._oled_value.show(f"New Offset: {self._default_offset}%")
 
     def _adjust_pitch(self, delta):
-        """Rigid transpose of the whole selection (or _last_note alone) by
-        `delta` keymap rows - all-or-nothing: if any target would clip past
+        """Shift+Select (see cc_change) - rigid transpose of the whole
+        selection (or _last_note alone) by `delta` keymap rows -
+        all-or-nothing: if any target would clip past
         either edge of the keymap, the whole turn is refused. Pitch is part
         of a note's zynseq identity, so this is remove-all then add-all
         (not an in-place setter), preserving each note's velocity/duration/
-        offset and re-pointing selection at the moved notes."""
+        offset/stutter count/stutter duration/play chance (same full
+        property set _paste_clip carries over) and re-pointing selection
+        at the moved notes. Snapshots right after every call (unlike the
+        4 knobs' own once-per-touch-session batching, see cc_change) -
+        each tick here already moves the *whole* selection by a full
+        scale-degree/semitone, a meaningful, audible change on its own,
+        unlike nudging velocity by +-1 out of 127."""
         if not delta:
             return
         targets = self._current_targets()
@@ -2521,6 +3141,9 @@ class StepSeqHandler(ModeHandlerBase):
                 self._libseq.getNoteVelocity(step, note_val),
                 self._libseq.getNoteDuration(step, note_val),
                 self._libseq.getNoteOffset(step, note_val),
+                self._libseq.getStutterCount(step, note_val),
+                self._libseq.getStutterDur(step, note_val),
+                self._libseq.getNotePlayChance(step, note_val),
             )
             for step, note_val, _ in plan
         }
@@ -2529,10 +3152,14 @@ class StepSeqHandler(ModeHandlerBase):
 
         new_selected, new_last = set(), None
         for step, old_note, new_note in plan:
-            vel, dur, off = props[(step, old_note)]
+            vel, dur, off, stutter_count, stutter_dur, chance = props[(step, old_note)]
             self._libseq.addNote(step, new_note, vel, dur, off)
+            self._libseq.setStutterCount(step, new_note, stutter_count)
+            self._libseq.setStutterDur(step, new_note, stutter_dur)
+            self._libseq.setNotePlayChance(step, new_note, chance)
             new_selected.add((step, new_note))
             new_last = (step, new_note)
+        self._libseq.savePatternSnapshot()
 
         if self._selected_notes:
             self._selected_notes = new_selected
@@ -2548,7 +3175,8 @@ class StepSeqHandler(ModeHandlerBase):
         self._oled_value.show(text)
 
     # ----------------------------------------------------------------------
-    # Solo 1-4: Stop / Mute / Solo / Quantize (see plan doc)
+    # Solo 1-4: Selection mode / Mute (or Copy+Cut while selecting) / Solo /
+    # Undo+Redo (Shift+Solo4 toggles Quantize instead) (see plan doc)
     # ----------------------------------------------------------------------
     def _get_chain(self):
         seq = self._get_selected_sequence()
@@ -2556,11 +3184,6 @@ class StepSeqHandler(ModeHandlerBase):
             return None
         chain_id = self._get_chain_id_by_sequence(self._zynseq.bank, seq)
         return self._chain_manager.chains.get(chain_id)
-
-    def _stop_sequence(self):
-        seq = self._get_selected_sequence()
-        if seq is not None:
-            self._libseq.setPlayState(self._zynseq.bank, seq, zynseq.SEQ_STOPPED)
 
     def _toggle_mute(self):
         chain = self._get_chain()
@@ -2580,31 +3203,110 @@ class StepSeqHandler(ModeHandlerBase):
         self._libseq.setQuantizeNotes(not self._libseq.getQuantizeNotes())
         self._update_leds()
 
+    def _nudge_gui_redraw(self):
+        """undo()/redo() (see _undo/_redo) restore a pattern's note data
+        by swapping it directly (Pattern::restoreSnapshot(), confirmed
+        reading pattern.cpp) - unlike addNote/removeNote/setNoteVelocity/
+        etc. (confirmed too - e.g. zynseq.cpp's own addNote/removeNote),
+        which all call setPatternModified() internally as a side effect,
+        restoreSnapshot() never touches that flag at all. The touchscreen
+        pattern editor's own refresh_status() polls exactly that flag
+        (isPatternModified()) to decide whether to redraw - so without
+        this, its view would sit stale after a Fire-triggered undo/redo
+        until some *other* edit incidentally flipped the flag for it.
+        setPatternModified() itself wants a raw Pattern* we don't have
+        from Python - but selectPattern(index) calls it internally too,
+        and only takes a plain index, so re-selecting the pattern we're
+        already on forces the same flag as a harmless side effect."""
+        self._libseq.selectPattern(self._libseq.getPatternIndex())
+
+    def _undo(self):
+        """Solo4 (plain) - libseq.undoPattern(), a real multi-level
+        snapshot stack (confirmed reading pattern.cpp - undo()/redo() just
+        walk a position back/forward through a vector of saved states,
+        only saveSnapshot() itself ever discards anything, and only the
+        abandoned "redo" branch, only when a genuinely new snapshot is
+        pushed after an undo). This class's own mutating actions
+        (_toggle_note/_extend_duration/_adjust_pitch/_paste_clip, plus a
+        once-per-touch-session savePatternSnapshot() for the 4 knobs' own
+        continuous adjustments - see cc_change) all push their own
+        snapshot right AFTER they mutate something, capturing the
+        resulting state rather than the one before it - found on
+        hardware that snapshotting before each edit instead (the first
+        version of this) made the first Undo jump back two edits at once
+        (undo() decrements its stored position *then* restores, so that
+        position needs to already BE a snapshot of the live state as it
+        is right now, not as it was before the most recent edit) and left
+        Redo unable to ever reach the very last edit at all, since its
+        own "after" state had never been its own snapshot to begin with.
+        refresh() also takes one baseline snapshot on entry, so the very
+        first edit of a session has something valid below it to land on.
+        Stale selection cleared on an actual change - the notes it refers
+        to may not be the same ones any more."""
+        if self._libseq.undoPattern():
+            self._selected_notes.clear()
+            self._reset_select_all_level()
+            self._paint_all()
+            self._nudge_gui_redraw()
+            self._oled_value.show("Undo")
+        else:
+            self._oled_value.show("Nothing To Undo")
+
+    def _redo(self):
+        """Alt+Solo4 - see _undo."""
+        if self._libseq.redoPattern():
+            self._selected_notes.clear()
+            self._reset_select_all_level()
+            self._paint_all()
+            self._nudge_gui_redraw()
+            self._oled_value.show("Redo")
+        else:
+            self._oled_value.show("Nothing To Redo")
+
     # ----------------------------------------------------------------------
     def note_on(self, note, velocity, shifted_override=None):
         self._on_shifted_override(shifted_override)
         if note in ZYNPOT_KNOBS:
             self._knobs_ease.reset(note)
-            return True
-        if note == BTN_SELECT_PRESS:
-            # Plain press only - Alt+Select-push is BACK globally (see
-            # midi_event, checked before dispatch ever reaches here). Select's
-            # own plain push is otherwise unbound in this mode, so it clears
-            # the selection instead.
-            self._selected_notes.clear()
-            self._paint_all()
+            # Fresh touch session - see note_off/cc_change/__init__'s own
+            # comment on self._knob_dirty/_knob_total_delta.
+            self._knob_dirty.discard(note)
+            self._knob_total_delta[note] = 0
             return True
         if note == BTN_SOLO_1:
-            self._stop_sequence()
+            # Alt+Solo1 = progressive select-all (_select_all); plain =
+            # toggle selection mode itself (_toggle_select_mode) - Stop
+            # moved off here entirely (the global transport Stop button
+            # already covers it, see midi_event's own BTN_STOP handling)
+            # to free this button up for selection.
+            self._select_all() if self._is_alt else self._toggle_select_mode()
             return True
         if note == BTN_SOLO_2:
-            self._toggle_mute()
+            # Only steals this button from Mute while selection mode is
+            # actually on - copy/cut only mean anything there anyway (see
+            # _toggle_select_mode, which disarms on the way out), so Mute
+            # keeps working normally the rest of the time. Alt+Solo2
+            # arms/disarms "cut"; plain arms/disarms "copy" - see
+            # _toggle_clip_mode.
+            if self._select_mode:
+                self._toggle_clip_mode("cut" if self._is_alt else "copy")
+            else:
+                self._toggle_mute()
             return True
         if note == BTN_SOLO_3:
             self._toggle_solo()
             return True
         if note == BTN_SOLO_4:
-            self._toggle_quantize()
+            # Shift+Solo4 toggles quantize (moved off plain - see
+            # _toggle_quantize); plain/Alt do Undo/Redo instead (see
+            # _undo/_redo) - reachable without needing Shift held first,
+            # unlike Shift+Select/Solo1/Solo2's own editing tools.
+            if self._is_shifted:
+                self._toggle_quantize()
+            elif self._is_alt:
+                self._redo()
+            else:
+                self._undo()
             return True
         if note == BTN_GRID_LEFT:
             if self._is_alt:
@@ -2657,6 +3359,15 @@ class StepSeqHandler(ModeHandlerBase):
     def note_off(self, note, shifted_override=None):
         if PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64:
             self._on_grid_release(note)
+        elif note in ZYNPOT_KNOBS:
+            # End of a touch-and-turn session - see __init__'s own
+            # comment on self._knob_dirty for why this is on release, not
+            # on touch. A no-op if nothing actually got adjusted this
+            # session (touched but never turned, or every tick got
+            # absorbed by the jitter filter).
+            if note in self._knob_dirty:
+                self._libseq.savePatternSnapshot()
+                self._knob_dirty.discard(note)
         elif note in (BTN_GRID_LEFT, BTN_GRID_RIGHT):
             # Revert the press-flash (see note_on) back to the current
             # idle color (boundary-aware, or bright if Alt/Shift is still
@@ -2671,6 +3382,13 @@ class StepSeqHandler(ModeHandlerBase):
 
     def cc_change(self, ccnum, ccval):
         if ccnum == KNOB_SELECT:
+            # Shift+Select transposes the current selection - plain or
+            # Alt+Select now fall through to the shared default instead
+            # (list navigation, up/down or left/right with Alt - see
+            # _select_knob_arrow), freeing Select back to its usual job
+            # when you're not deliberately holding Shift for this.
+            if not self._is_shifted:
+                return None
             delta = ccval if ccval < 64 else ccval - 128
             self._adjust_pitch(delta)
             return True
@@ -2682,10 +3400,36 @@ class StepSeqHandler(ModeHandlerBase):
         if delta is None:
             return True
 
+        if not self._select_mode:
+            # No existing note to apply to outside selection mode - these
+            # 4 knobs adjust the sticky "next note" defaults instead (see
+            # __init__'s own comment on self._default_velocity/etc. and
+            # _toggle_note's add branch) - pure Python state, no pattern
+            # mutation, so no undo snapshot involved either (unlike the
+            # branch below).
+            if ccnum == KNOB_VOLUME:
+                self._adjust_default_velocity(delta)
+            elif ccnum == KNOB_PAN:
+                self._adjust_default_duration(delta)
+            elif ccnum == KNOB_FILTER:
+                self._adjust_default_chance(delta) if self._is_shifted else self._adjust_default_stutter_count(delta)
+            elif ccnum == KNOB_RESONANCE:
+                self._adjust_default_offset(delta) if self._is_shifted else self._adjust_default_stutter_dur(delta)
+            return True
+
+        # Marks this knob's own touch session as having a real edit to
+        # snapshot once it's released (note_off) - not snapshotted here
+        # on the tick itself, see __init__'s own comment on
+        # self._knob_dirty for why.
+        self._knob_dirty.add(ccnum)
+        # Running total for this touch session - see __init__'s own
+        # comment on self._knob_total_delta.
+        total = self._knob_total_delta[ccnum] = self._knob_total_delta.get(ccnum, 0) + delta
+
         if ccnum == KNOB_VOLUME:
-            self._adjust_velocity(delta)
+            self._adjust_velocity(delta, total)
         elif ccnum == KNOB_PAN:
-            self._adjust_duration(delta)
+            self._adjust_duration(delta, total)
         elif ccnum == KNOB_FILTER:
             # Shift, not Alt (moved - see the plan doc): Alt+touch on any
             # of the 4 channel-strip knobs is a global "zynpot switch push"
@@ -2693,9 +3437,12 @@ class StepSeqHandler(ModeHandlerBase):
             # before dispatch ever reaches here - Alt+Filter's own touch
             # never reached this handler at all, and releasing it fired an
             # unrelated CUIA on top. Shift has no such collision.
-            self._adjust_chance(delta) if self._is_shifted else self._adjust_stutter_count(delta)
+            self._adjust_chance(delta, total) if self._is_shifted else self._adjust_stutter_count(delta, total)
         elif ccnum == KNOB_RESONANCE:
-            self._adjust_stutter_dur(delta)
+            # Shift+Resonance = offset (micro-timing), same reasoning as
+            # Filter's own Shift split above - Alt+touch is the one that
+            # collides globally, Shift doesn't.
+            self._adjust_offset(delta, total) if self._is_shifted else self._adjust_stutter_dur(delta, total)
         return True
 
 
