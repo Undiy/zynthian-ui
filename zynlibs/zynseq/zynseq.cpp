@@ -1619,7 +1619,7 @@ uint32_t getSteps() {
 }
 
 uint32_t getPatternLength(uint32_t pattern) {
-    Pattern* pPattern = g_seqMan.getPattern(g_nPattern);
+    Pattern* pPattern = g_seqMan.getPattern(pattern);
     if (pPattern)
         return pPattern->getLength();
     return 0;
