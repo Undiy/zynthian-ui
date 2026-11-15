@@ -59,6 +59,7 @@ import queue
 import colorsys
 import logging
 import multiprocessing as mp
+from threading import Thread
 
 from PIL import Image, ImageDraw, ImageFont
 
@@ -2326,8 +2327,34 @@ class StepSeqHandler(ModeHandlerBase):
     # instead of APC's 8, the other 3 rows go dark (nothing else shown
     # there for this first pass).
     ARRANGER_ROW = 3
-    COLOR_ARRANGER_CURRENT = (90, 45, 0)  # the chain slot currently selected/being edited
+    # The exact chain SLOT currently selected/being edited/playing, and
+    # its "twins" (other slots sharing that same pattern - a repeat/a
+    # palette paste/replace of an existing one), share one hue -
+    # yellow-green, distinct from COLOR_ARRANGER_SLOT's plain orange -
+    # differing only in brightness (bright vs dim), not hue: "let's use
+    # another color for active cells of 4th row, not just brightness...
+    # active and/or playing would be yellow-green and bright" / "twins
+    # would be yellow-green, but dim" / "let's make twins a bit
+    # dimmer". ARRANGER_TAIL_DIM_FACTOR is a separate, unrelated
+    # dimming applied on top of whichever of these is chosen, for a
+    # wide span's own trailing pads.
+    COLOR_ARRANGER_CURRENT = (55, 90, 0)
+    COLOR_ARRANGER_TWIN = tuple(round(c * 0.35) for c in COLOR_ARRANGER_CURRENT)
     COLOR_ARRANGER_SLOT = (25, 12, 0)     # any other real pattern in the chain
+    COLOR_ARRANGER_MATCH = (0, 70, 15)    # chain slot(s) using the armed palette pattern
+    ARRANGER_TAIL_DIM_FACTOR = 0.35       # dims a span's trailing pads relative to its head
+
+    # A pattern's width in ARRANGER_ROW is shown in pads, not just one
+    # pad per chain slot - "could we see pattern length in arranger -
+    # how many pads it spans" - using the exact same clocks-per-division
+    # the touchscreen Arranger screen itself already uses
+    # (zynthian_gui_arranger.py's own self.clocks_per_division) so this
+    # reuses an established approximation rather than inventing a new
+    # one. 16 divisions (one bar at the common 4-beat/16-step default
+    # resolution) = 1 pad, so the common case keeps today's "1 pattern =
+    # 1 pad" look and only patterns longer than a bar visibly grow.
+    ARRANGER_CLOCKS_PER_DIVISION = 24
+    ARRANGER_DIVISIONS_PER_PAD = 16
 
     def __init__(self, state_manager, leds: FeedbackLEDs, pads: PadLEDs, oled_refresh_cb=None):
         super().__init__(state_manager)
@@ -2470,6 +2497,21 @@ class StepSeqHandler(ModeHandlerBase):
         # chain slots while looking at the chain keeps showing the chain.
         self._arranger_mode = False
         self._chain_patterns = []  # ordered pattern indices - see _toggle_arranger_mode
+        # Which exact chain SLOT is focused - distinct from
+        # getPatternIndex(), which only identifies the *pattern* and is
+        # ambiguous whenever it has "twins" (the same pattern placed at
+        # more than one chain position) - see
+        # _arranger_sync_current_idx's own comment for how this stays
+        # correct across taps/splices.
+        self._arranger_current_idx = None
+
+        # Arranger "palette" (rows 0-2, see _build_palette/_paint_palette)
+        # plus the armed-pattern/pending-action state behind Solo2-4's
+        # remove/paste/replace gestures (see _arranger_note_on) - reset
+        # together with _chain_patterns, same lifetime.
+        self._palette_patterns = []  # ordered (pattern, group) tuples - see _build_palette
+        self._armed_palette_pattern = None  # set by tapping a palette pad, consumed by Solo3/4
+        self._arranger_pending_action = None  # None | "add" | "paste" | "replace" | "remove"
 
     def set_alt(self, state):
         # Momentary BTN_ALT, used as a modifier for Grid Left/Right
@@ -2799,22 +2841,31 @@ class StepSeqHandler(ModeHandlerBase):
         super().set_active(active)
         if active:
             self._playhead_timer.add("playhead", self.PLAYHEAD_POLL_MS, self._poll_playhead)
-            # A genuine fresh entry into StepSeq (as opposed to switching
-            # pattern-chain slots while already looking at the arranger
-            # overlay, see _arranger_select_slot) decides the view from
-            # scratch - see __init__'s own comment on why refresh() itself
-            # doesn't reset this. Auto-opens the arranger overlay for a
-            # cell that already has more than one pattern chained in its
-            # track - asked for directly ("open arranger first for cells
-            # that have multiple patterns") - rather than always landing
-            # on a step-editing view that has nothing meaningful to show
-            # for a cell like that anyway (StepSeq's own single-pattern
-            # grid can only ever show one pattern at a time).
-            seq = self._get_selected_sequence()
-            self._arranger_mode = (seq is not None
-                                    and self._libseq.getPatternsInTrack(self._zynseq.bank, seq, 0) != 1)
+            # A genuine fresh entry into StepSeq always lands on the
+            # plain step-editing view, even for a cell with more than
+            # one pattern chained in its track - used to auto-open the
+            # arranger overlay for that case instead, but that meant the
+            # real screen's own state (pattern_editor vs. arranger)
+            # depended on *how* you got here, which was the actual
+            # source of the inconsistency reported on hardware ("when I
+            # open multi-pattern tab from zynpad, pattern screen is
+            # shown... when I switch to pattern and back arranger -
+            # screen is synced"): BTN_STEP's own toggle
+            # (_toggle_arranger_mode) switches the real screen too,
+            # auto-open here never did (see its own old comment, kept
+            # below in git history, on why that queued CUIA would have
+            # raced _show_pattern_editor's own screen transition).
+            # Always landing here instead - asked for directly ("let's
+            # open pattern view first always... for multi-pattern pads
+            # too") - means entry is consistent regardless of pattern
+            # count; BTN_STEP still opens the arranger overlay (and
+            # switches the real screen) on request.
+            self._arranger_mode = False
         else:
             self._playhead_timer.remove("playhead")
+            self._arranger_mode = False
+            self._armed_palette_pattern = None
+            self._arranger_pending_action = None
 
     def refresh(self):
         # g_pSequence ("pattern editor sequence", see zynseq.cpp) is a
@@ -2847,14 +2898,36 @@ class StepSeqHandler(ModeHandlerBase):
             # *this* sequence's own patterns, defaulting to the first
             # chain slot if it currently isn't one at all. Also builds
             # self._chain_patterns here (not just in
-            # _toggle_arranger_mode) so set_active(True)'s own auto-open
-            # decision (see its own comment) has a populated chain to
-            # show immediately, before any toggle happens.
+            # _toggle_arranger_mode) so a chain-slot switch/new pattern
+            # made while the arranger overlay is already showing
+            # (_arranger_select_slot/_arranger_splice, both call
+            # refresh()) keeps it current - a fresh activation itself
+            # never has _arranger_mode true (set_active always starts
+            # on the plain step view, see its own comment), so this
+            # branch is a no-op there.
             chain = self._get_sequence_patterns(self._zynseq.bank, seq, create=True)
             if self._libseq.getPatternIndex() not in chain:
                 self._libseq.selectPattern(chain[0])
             if self._arranger_mode:
                 self._chain_patterns = chain
+                self._arranger_sync_current_idx()
+                # _build_palette() reads self._chain_patterns, so it has
+                # to be rebuilt here too, not just in
+                # _toggle_arranger_mode, to stay current across those
+                # same already-in-arranger refresh() calls.
+                self._build_palette()
+                # Keeps both the real Arranger screen's own cursor
+                # (_arranger_sync_screen - only actually visible once
+                # _arranger_set_screen has switched the display to it,
+                # see _toggle_arranger_mode/set_active) and the Pattern
+                # Editor's background state (_sync_pattern_editor, so
+                # it's ready the moment the user does switch to it)
+                # matching whatever pattern is now selected - every
+                # selection change already routed through refresh()
+                # (slot taps, paste/replace, remove, add) picks this up
+                # for free.
+                self._arranger_sync_screen()
+                self._sync_pattern_editor(self._libseq.getPatternIndex())
         self._load_keymap()
         # Pattern length (getSteps()) is NOT cached (unlike this method's
         # other resets, which are genuinely one-shot on activation) -
@@ -2902,20 +2975,81 @@ class StepSeqHandler(ModeHandlerBase):
             for col in range(16):
                 self._paint_pad(row, col)
 
+    def _arranger_chain_spans(self):
+        """Maps self._chain_patterns to the column ranges they occupy in
+        ARRANGER_ROW, one pad per bar's worth of the pattern's own
+        length (ARRANGER_DIVISIONS_PER_PAD divisions of
+        ARRANGER_CLOCKS_PER_DIVISION clocks each - see that constant's
+        own comment) instead of one pad per chain slot regardless of
+        length, so a pattern's width in the row actually shows how long
+        it is ("how many pads it spans"). getPatternLength() is
+        argument-based and safe to call for any pattern regardless of
+        which one is currently selected (see the earlier zynseq.cpp
+        fix/plan doc entry - unlike getSteps()/getClocksPerStep(), which
+        only ever describe whichever pattern is g_nPattern right now).
+        Minimum 1 pad per pattern, truncated at the row's own 16 pads -
+        no paging/scrolling for this first pass (same call made for the
+        palette rows). Returns a list of (start_col, width, chain_index)
+        tuples, one per chain pattern that fits."""
+        spans = []
+        col = 0
+        for idx, pattern in enumerate(self._chain_patterns):
+            if col >= 16:
+                break
+            divisions = self._libseq.getPatternLength(pattern) // self.ARRANGER_CLOCKS_PER_DIVISION
+            width = max(1, -(-divisions // self.ARRANGER_DIVISIONS_PER_PAD))  # ceil div
+            width = min(width, 16 - col)
+            spans.append((col, width, idx))
+            col += width
+        return spans
+
     def _paint_arranger(self):
         """The arranger overlay's own pad grid - see
-        _toggle_arranger_mode's own comment. Just ARRANGER_ROW shows
-        anything; the other 3 rows go dark for this first pass."""
+        _toggle_arranger_mode's own comment. ARRANGER_ROW shows the
+        pattern chain; rows 0-2 show the palette (_paint_palette). Each
+        chain pattern fills its own span (_arranger_chain_spans) rather
+        than a single pad: the span's first pad is shown at full
+        brightness and any trailing pads are dimmed
+        (ARRANGER_TAIL_DIM_FACTOR), so a run of same-colored pads still
+        reads as "one long pattern" rather than several short ones, with
+        a clear bright marker at each pattern's own start. Priority per
+        slot: the exact focused slot (self._arranger_current_idx, kept
+        correct across taps/splices/playback-follow by
+        _arranger_sync_current_idx - NOT just "pattern == getPatternIndex()",
+        which can't tell two "twin" slots sharing the same pattern
+        apart) wins as COLOR_ARRANGER_CURRENT; failing that, a slot
+        whose pattern equals self._armed_palette_pattern (set by
+        tapping a palette pad - see _arranger_note_on) is tinted
+        COLOR_ARRANGER_MATCH, so placing/removing it is visible before
+        it's actually committed; failing that, any other slot sharing
+        the focused slot's own pattern - a "twin" placed elsewhere in
+        the chain via a repeat/paste/replace of it - gets
+        COLOR_ARRANGER_TWIN - the same yellow-green hue as CURRENT, just
+        dim rather than bright (see that constant's own comment), so
+        it still reads as "related to what's focused" without being
+        mistaken for the one slot actually selected/playing, and
+        without being confused with a plain (orange) slot either -
+        asked for directly: "we need to differentiate the twins of
+        pattern with actual pattern being played"."""
         current_pattern = self._libseq.getPatternIndex()
         for row in range(4):
             for col in range(16):
-                note_pad = _pad(row, col)
-                if row != self.ARRANGER_ROW or col >= len(self._chain_patterns):
-                    self._pads.pad_off(note_pad)
-                    continue
-                is_current = self._chain_patterns[col] == current_pattern
-                color = self.COLOR_ARRANGER_CURRENT if is_current else self.COLOR_ARRANGER_SLOT
-                self._pads.set_pad(note_pad, *color)
+                self._pads.pad_off(_pad(row, col))
+        self._paint_palette()
+        for start_col, width, idx in self._arranger_chain_spans():
+            pattern = self._chain_patterns[idx]
+            if idx == self._arranger_current_idx:
+                color = self.COLOR_ARRANGER_CURRENT
+            elif pattern == self._armed_palette_pattern:
+                color = self.COLOR_ARRANGER_MATCH
+            elif pattern == current_pattern:
+                color = self.COLOR_ARRANGER_TWIN
+            else:
+                color = self.COLOR_ARRANGER_SLOT
+            tail_color = tuple(round(c * self.ARRANGER_TAIL_DIM_FACTOR) for c in color)
+            for offset in range(width):
+                pad_color = color if offset == 0 else tail_color
+                self._pads.set_pad(_pad(self.ARRANGER_ROW, start_col + offset), *pad_color)
 
     def _toggle_arranger_mode(self):
         """BTN_STEP, while already in StepSeq (see the top-level driver's
@@ -2930,56 +3064,416 @@ class StepSeqHandler(ModeHandlerBase):
         changed via this same overlay or the real touchscreen Arranger
         screen, never while this handler had no way to show it anyway."""
         self._arranger_mode = not self._arranger_mode
+        self._armed_palette_pattern = None
+        self._arranger_pending_action = None
+        self._arranger_set_screen(self._arranger_mode)
         if self._arranger_mode:
             seq = self._get_selected_sequence()
             self._chain_patterns = self._get_sequence_patterns(self._zynseq.bank, seq, create=True)
+            self._arranger_sync_current_idx()
+            self._build_palette()
+            self._arranger_sync_screen()
         self._paint_all()
+        self._update_leds()
         self._oled_value.show("Arranger" if self._arranger_mode else "Step")
+
+    def _arranger_set_screen(self, active):
+        """Switches the real touchscreen to/from the Arranger screen to
+        match _arranger_mode - asked for directly: "I really liked how
+        arranger view on screen is in sync with current selected
+        pattern in patman - could we have this too?"
+
+        Entering goes through the normal CUIA dispatch
+        (cuia_screen_arranger, zynthian_gui.py) - it's a plain
+        show_screen("arranger"), nothing smarter.
+
+        Exiting deliberately does NOT send the SCREEN_PATTERN_EDITOR
+        CUIA - cuia_screen_pattern_editor (zynthian_gui.py) is not a
+        dumb screen switch: with current_screen still "arranger" at
+        that point, it tries self.screens["arranger"].
+        show_pattern_editor() first, which can itself redirect right
+        back to the real Arranger screen for the exact multi-pattern-
+        chain case this overlay exists for - confirmed on hardware
+        ("arranger screen didn't switch to pattern first time... did
+        switch after 2 more pushes", and, downstream of current_screen
+        then staying stuck on "arranger" while _arranger_mode had
+        already gone back to False: a missing playhead and playback
+        routed to the wrong chain, both because cuia_toggle_audio_play
+        only special-cases current_screen == "pattern_editor"). This is
+        the identical "smart redirect" class of bug _show_pattern_editor's
+        own skip_arranger=True was already created to bypass on the way
+        IN - calling the real show_screen() directly here bypasses it
+        on the way OUT too, same fix applied symmetrically.
+
+        cuia_toggle_audio_play/cuia_stop_audio_play still only special-
+        case current_screen == "pattern_editor", not "arranger" - the
+        top-level driver's own _arranger_toggle_play/_arranger_stop_play
+        bypass that gap while this overlay is actually showing, same as
+        the APC key25 mk2 driver's own arranger mode already does
+        unconditionally for Play."""
+        if active:
+            self._state_manager.send_cuia("SCREEN_ARRANGER")
+        else:
+            zynthian_gui_config.zyngui.show_screen("pattern_editor")
+
+    def _arranger_sync_current_idx(self):
+        """Keeps self._arranger_current_idx - which exact chain SLOT is
+        focused - valid. _arranger_select_slot/_arranger_splice already
+        set it directly whenever they pick a specific slot themselves;
+        this is the fallback for everywhere else refresh() runs while
+        _arranger_mode is true (a fresh entry into the overlay, or
+        after a splice that didn't itself pick one - e.g. removing the
+        focused slot, see _arranger_splice) - re-derives it as the
+        *first* chain slot using whatever pattern selectPattern()
+        landed on, same ambiguity _arranger_sync_screen used to have on
+        its own before this existed (now it just reads this instead -
+        see its own comment). Only recomputes when the existing value
+        is actually stale (out of range, or its own slot's pattern no
+        longer matches getPatternIndex()), so an explicitly-set exact
+        twin slot is never second-guessed back to "first occurrence"
+        just because refresh() happened to run again."""
+        pattern = self._libseq.getPatternIndex()
+        idx = self._arranger_current_idx
+        if (idx is None or idx >= len(self._chain_patterns)
+                or self._chain_patterns[idx] != pattern):
+            self._arranger_current_idx = self._chain_patterns.index(pattern) if pattern in self._chain_patterns else 0
+
+    def _arranger_sync_screen(self):
+        """Moves the real on-screen Arranger screen's own cursor to
+        match self._arranger_current_idx (the exact focused slot, kept
+        correct by _arranger_sync_current_idx/_arranger_select_slot/
+        _arranger_splice - NOT re-derived from getPatternIndex() here,
+        which can't tell "twin" slots sharing the same pattern apart) -
+        same sync APC's own arranger mode keeps via _update_ui_arranger
+        (inherited from ModeHandlerBase, same helper APC's driver
+        uses), but calls the real screen's own select_position(sequence,
+        track, time) instead of a raw row index: Arranger's rows are a
+        flattened list across every sequence's own tracks
+        (self.sequence_tracks), and select_position looks up the right
+        row for a given sequence/track itself rather than assuming row
+        == sequence index (true only because every sequence APC deals
+        with here happens to have exactly one track)."""
+        chain_idx = self._arranger_current_idx or 0
+        position = sum(self._libseq.getPatternLength(p) for p in self._chain_patterns[:chain_idx])
+        col = position // self.ARRANGER_CLOCKS_PER_DIVISION
+        seq = self._get_selected_sequence()
+
+        def run():
+            zynthian_gui_config.zyngui.screens["arranger"].select_position(sequence=seq, track=0, time=col)
+        Thread(target=run, daemon=True).start()
+
+    def _build_palette(self):
+        """Builds the arranger overlay's "palette" (rows 0-2, see
+        _paint_palette) of patterns already used in the *current*
+        chain - originally built from every sequence in the bank, but
+        narrowed to just this one after trying the wider scope on real
+        hardware: "I found no real use for palette for other chains,
+        though... let's keep only the patterns for current chain
+        there". Still deduped (self._chain_patterns can repeat a
+        pattern via a palette paste/replace of its own), so a pattern
+        used 3 times in the chain still only gets one palette pad -
+        picking it there arms it for another paste/replace elsewhere
+        in the chain, same as before. Every entry
+        shares this sequence's own group (getGroup()), so
+        _paint_palette tints it the same hue zynpad's own pad grid uses
+        for that group (ZynpadHandler.GROUP_COLORS)."""
+        seq = self._get_selected_sequence()
+        group = self._libseq.getGroup(self._zynseq.bank, seq)
+        seen = []
+        for pattern in self._chain_patterns:
+            if pattern not in seen:
+                seen.append(pattern)
+        self._palette_patterns = [(pattern, group) for pattern in seen]
+
+    def _paint_palette(self):
+        """Rows 0-2 of the arranger overlay - see _build_palette's own
+        comment. Each pattern gets one pad, tinted by its owning
+        sequence's group (ZynpadHandler.GROUP_COLORS, same per-group
+        hue zynpad's pad grid itself uses). Any pattern that's also
+        currently armed (self._armed_palette_pattern, set by tapping
+        its own palette pad - see _arranger_note_on) is shown at full
+        group brightness; every other palette pad is shown dim, so the
+        armed one stands out while still showing its own group color
+        rather than a generic "selected" white/grey."""
+        for row in range(3):
+            for col in range(16):
+                idx = row * 16 + col
+                note_pad = _pad(row, col)
+                if idx >= len(self._palette_patterns):
+                    self._pads.pad_off(note_pad)
+                    continue
+                pattern, group = self._palette_patterns[idx]
+                bright = pattern == self._armed_palette_pattern
+                colors = ZynpadHandler.GROUP_COLORS if bright else ZynpadHandler.GROUP_COLORS_DIM
+                self._pads.set_pad(note_pad, *colors[group % len(ZynpadHandler.GROUP_COLORS)])
 
     def _arranger_note_on(self, note):
         """note_on's entire dispatch while the arranger overlay (see
-        _toggle_arranger_mode) is showing - deliberately narrow for this
-        first pass: a pad in ARRANGER_ROW jumps to that chain slot's
-        pattern (_arranger_select_slot), Solo1 appends a new pattern at
-        the end of the chain (_arranger_add_pattern) - everything else
-        (Grid/Pattern/other Solo/knobs) is swallowed rather than running
-        StepSeq's own normal step-editing logic against a grid that
-        isn't currently showing steps at all."""
+        _toggle_arranger_mode) is showing - a pad in ARRANGER_ROW jumps
+        to that chain slot's pattern (_arranger_select_slot) when
+        nothing else is pending; a pad in the palette (rows 0-2,
+        _arranger_palette_tap) arms/disarms it as the pattern to place
+        elsewhere - tapping it alone never places anything. The 4 Solo
+        buttons are one dedicated action each - the old Alt+Solo1
+        ("repeat the current pattern") is gone, superseded by palette-
+        arm + paste/replace, which is strictly more general; Alt now
+        means something new, only on Solo1:
+          Solo1 - add a new, blank pattern at the end of the chain
+            (_arranger_add_pattern), immediately, no destination tap.
+            Alt+Solo1 instead arms "add": the next ARRANGER_ROW tap
+            creates the blank pattern and inserts it *at* that slot
+            (pushing it and the tail later) rather than always at the
+            tail - "support adding 'empty' pattern at any place, not
+            only the tail". No armed palette pattern needed for either.
+          Solo2 - arm "remove"; the next ARRANGER_ROW tap removes that
+            slot and rebuilds the tail (_arranger_row_tap); no armed
+            pattern needed either.
+          Solo3 - arm "paste": needs an armed palette pattern; the next
+            ARRANGER_ROW tap inserts it *ahead of* the tapped slot,
+            pushing that slot and the rest of the tail later rather
+            than replacing anything there.
+          Solo4 - arm "replace": needs an armed palette pattern; the
+            next ARRANGER_ROW tap swaps it in for the tapped slot,
+            dropping what was there.
+        All asked for directly: "tap a pad with a pattern, the matching
+        patterns in arranger row are indicated... add with smth like
+        soloN button + destination pad in arranger" / "remove would
+        work the same - just rebuild the tail without adding anything
+        new" / "an alternate mode for replace, that would paste
+        pattern, moving the target and the rest of the tail rather than
+        change the target". Everything else (Grid/Pattern/knobs) is
+        swallowed rather than running StepSeq's own normal step-editing
+        logic against a grid that isn't currently showing steps at
+        all."""
         if note == BTN_SOLO_1:
-            self._arranger_add_pattern()
+            if self._is_alt:
+                self._armed_palette_pattern = None  # "add" doesn't use it
+                self._arranger_pending_action = "add"
+                self._update_leds()
+                self._oled_value.show("Tap a slot to add")
+            else:
+                # Plain Solo1 acts immediately rather than arming
+                # anything of its own, so it's the one case that
+                # wouldn't otherwise clear a leftover armed state from
+                # an earlier Solo2-4/palette press - asked for
+                # directly: "let's disarm when another (mainly solo1)
+                # is pressed".
+                self._arranger_disarm()
+                self._arranger_add_pattern()
+            return True
+        if note == BTN_SOLO_2:
+            self._armed_palette_pattern = None  # "remove" doesn't use it
+            self._arranger_pending_action = "remove"
+            self._update_leds()
+            self._oled_value.show("Tap a slot to remove")
+            return True
+        if note in (BTN_SOLO_3, BTN_SOLO_4):
+            if self._armed_palette_pattern is None:
+                self._oled_value.show("Tap a palette pad first")
+            else:
+                self._arranger_pending_action = "paste" if note == BTN_SOLO_3 else "replace"
+                self._update_leds()
+                self._oled_value.show(f"Tap a slot to {self._arranger_pending_action}")
             return True
         if PAD_NOTE_BASE <= note < PAD_NOTE_BASE + 64:
-            idx = note - PAD_NOTE_BASE
-            row, col = idx // 16, idx % 16
+            pad_idx = note - PAD_NOTE_BASE
+            row, col = pad_idx // 16, pad_idx % 16
             if row == self.ARRANGER_ROW:
-                self._arranger_select_slot(col)
+                self._arranger_row_tap(col)
+            elif row < self.ARRANGER_ROW:
+                self._arranger_palette_tap(row, col)
         return True
 
-    def _arranger_select_slot(self, col):
-        if col >= len(self._chain_patterns):
+    def _arranger_disarm(self):
+        """Clears both halves of the "armed" state - the pending
+        action (Alt+Solo1/Solo2-4) and the armed palette pattern - so
+        neither lingers past whatever the user does next. Asked for
+        directly: "let's disarm when another (mainly solo1) is
+        pressed and if palette or arranger pad is pushed". Doesn't
+        repaint/update LEDs itself - every caller already does that as
+        part of its own response."""
+        self._arranger_pending_action = None
+        self._armed_palette_pattern = None
+
+    def _sync_pattern_editor(self, pattern):
+        """Keeps the real on-screen Pattern Editor ("patman") showing
+        whichever pattern is now selected in the arranger overlay -
+        called from refresh() itself so every selection change already
+        routed through there (slot taps, paste/replace, remove, add)
+        picks this up for free. The shared base's own
+        _refresh_pattern_editor (used once, at StepSeq entry) always
+        loads *track 0's first* pattern (getPattern(bank, seq, 0, 0)),
+        not whichever one is actually selected, so this calls the real
+        screen's own load_pattern(pattern) directly instead - same
+        thing _refresh_pattern_editor does internally, just for an
+        arbitrary pattern rather than always position 0. Runs
+        unconditionally, regardless of whether 'pattern_editor' is the
+        screen actually on display right now - cheap, and keeps it
+        ready the moment the user does switch to it, same as
+        _refresh_pattern_editor's own existing precedent."""
+        patted = zynthian_gui_config.zyngui.screens['pattern_editor']
+        patted.bank = self._zynseq.bank
+        patted.sequence = self._get_selected_sequence()
+        patted.load_pattern(pattern)
+
+    def _arranger_col_to_chain_idx(self, col):
+        """Maps an ARRANGER_ROW column to the chain slot it falls in
+        (_arranger_chain_spans), or to len(self._chain_patterns) - i.e.
+        "past the end" - if it's in the dark area after every existing
+        span. Shared by plain slot-selection taps and the paste/
+        replace/remove gestures (_arranger_row_tap)."""
+        for start_col, width, chain_idx in self._arranger_chain_spans():
+            if start_col <= col < start_col + width:
+                return chain_idx
+        return len(self._chain_patterns)
+
+    def _arranger_row_tap(self, col):
+        """A tap on ARRANGER_ROW - either consumes a pending add/paste/
+        replace/remove action armed via Alt+Solo1/Solo2-4
+        (_arranger_note_on), or falls back to plain slot selection
+        (_arranger_select_slot) when nothing is pending."""
+        chain_idx = self._arranger_col_to_chain_idx(col)
+        action = self._arranger_pending_action
+        self._arranger_pending_action = None
+        # Clears the armed cap right away regardless of which branch
+        # below actually runs (some just call _paint_all(), not
+        # refresh(), which would otherwise leave a now-stale cap lit).
+        self._update_leds()
+        if action in ("add", "paste", "replace"):
+            if action == "add":
+                pattern = self._libseq.createPattern()
+            else:
+                pattern = self._armed_palette_pattern
+                self._armed_palette_pattern = None
+            self._arranger_splice(chain_idx, pattern, insert=(action != "replace"))
+            verb = {"add": "added", "paste": "pasted", "replace": "placed"}[action]
+            self._oled_value.show(f"Pattern {chain_idx + 1}: {verb}")
+        elif action == "remove":
+            if chain_idx >= len(self._chain_patterns):
+                self._paint_all()  # tapped empty space - nothing to remove
+            elif len(self._chain_patterns) == 1:
+                self._oled_value.show("Can't remove last pattern")
+                self._paint_all()
+            else:
+                self._arranger_splice(chain_idx, None)
+                self._oled_value.show("Pattern removed")
+        else:
+            # Nothing was pending, so this is a plain slot-select tap -
+            # still disarms a leftover armed palette pattern (the
+            # pending action was already None here) per the same
+            # request: "...if palette or arranger pad is pushed".
+            self._armed_palette_pattern = None
+            self._arranger_select_slot(chain_idx)
+
+    def _arranger_palette_tap(self, row, col):
+        """A tap on one of the palette rows (0-2, _paint_palette) - arms
+        that pattern as the one Solo3 (paste) or Solo4 (replace) will
+        place next, or disarms it if it was already armed (tap again to
+        cancel). Never places anything by itself - see
+        _arranger_note_on."""
+        idx = row * 16 + col
+        if idx >= len(self._palette_patterns):
             return
-        pattern = self._chain_patterns[col]
+        pattern, _group = self._palette_patterns[idx]
+        self._armed_palette_pattern = None if pattern == self._armed_palette_pattern else pattern
+        self._arranger_pending_action = None
+        self._paint_all()
+        self._update_leds()  # clears any already-armed cap along with it
+
+    def _arranger_select_slot(self, chain_idx):
+        if chain_idx >= len(self._chain_patterns) or chain_idx == self._arranger_current_idx:
+            # Already focused on this exact slot - including the
+            # "twin" case (same pattern, but THIS slot was already the
+            # one selected), where comparing by pattern value alone
+            # (as this used to) would wrongly treat every subsequent
+            # tap on it as a no-op forever once any one twin was
+            # focused.
+            return
+        self._arranger_current_idx = chain_idx
+        pattern = self._chain_patterns[chain_idx]
         if pattern != self._libseq.getPatternIndex():
             self._libseq.selectPattern(pattern)
-            # Reloads keymap/steps/scale/tonic/playhead for the new
-            # pattern, same as a fresh activation would - _arranger_mode
-            # itself is untouched (see __init__'s own comment), so this
-            # keeps showing the chain, just re-highlighting whichever
-            # slot is now current (_paint_arranger reads
-            # getPatternIndex() fresh every call).
-            self.refresh()
+        # Reloads keymap/steps/scale/tonic/playhead for the new
+        # pattern, same as a fresh activation would - _arranger_mode
+        # itself is untouched (see __init__'s own comment), so this
+        # keeps showing the chain, just re-highlighting whichever slot
+        # is now current (_paint_arranger reads
+        # self._arranger_current_idx fresh every call). Always runs
+        # now, even when the pattern value didn't change (a same-
+        # pattern twin slot) - the real Arranger screen's own cursor
+        # (_arranger_sync_screen) still needs to move to this slot's
+        # own position.
+        self.refresh()
 
-    def _arranger_add_pattern(self):
+    def _arranger_splice(self, chain_idx, new_pattern, insert=False):
+        """The one shared mechanism behind add/paste/replace/remove in
+        the arranger overlay - asked for directly: "append (tail) and
+        replace (swap with the current pattern on pad) on the first
+        run, append-and-shift-tail?" / "remove would work the same -
+        just rebuild the tail without adding anything new" / "an
+        alternate mode for replace, that would paste pattern, moving
+        the target and the rest of the tail rather than change the
+        target". addPattern/removePattern place patterns by absolute
+        CLOCK POSITION, not slot index, so inserting, swapping or
+        removing a mid-chain slot whose length differs from what
+        follows requires removing every pattern from chain_idx onward
+        and re-adding them at recomputed positions - true even when
+        nothing actually needs to shift (an equal-length swap), so
+        there's no separate "fast path" for that case, just this one
+        general one.
+
+        chain_idx == len(self._chain_patterns) is a plain append
+        (nothing after it to reflow - insert and replace collapse to
+        the same thing there, since there's no target to keep or
+        drop). new_pattern=None removes chain_idx without replacing it
+        (insert is meaningless combined with that, never called this
+        way). insert=True keeps the pattern that was at chain_idx (and
+        everything after it) in the rebuilt tail instead of dropping
+        it - "paste" (new_pattern lands ahead of the target, pushing it
+        and the rest of the tail later) rather than "replace" (new_pattern
+        swaps in for the target, which is dropped)."""
         seq = self._get_selected_sequence()
         bank = self._zynseq.bank
-        position = sum(self._libseq.getPatternLength(p) for p in self._chain_patterns)
-        pattern = self._libseq.createPattern()
-        if not self._zynseq.add_pattern(bank, seq, 0, position, pattern):
-            return
+        tail = self._chain_patterns[chain_idx:]
+        position = sum(self._libseq.getPatternLength(p) for p in self._chain_patterns[:chain_idx])
+        # Remove chain_idx and everything after it, each by its own OLD
+        # position - removing by position never moves any of the
+        # others, since zynseq keys patterns by absolute clock position
+        # rather than by slot index.
+        pos = position
+        for pattern in tail:
+            self._zynseq.remove_pattern(bank, seq, 0, pos)
+            pos += self._libseq.getPatternLength(pattern)
+        # Rebuild: new_pattern first (add/paste/replace), if given,
+        # then the kept part of the tail - all of it for a paste
+        # (insert=True, the old chain_idx pattern just moves later),
+        # everything AFTER chain_idx for a replace/remove (tail[1:] -
+        # tail[0] is the slot being swapped out or dropped, never
+        # kept) - sequentially re-positioned from `position` using each
+        # pattern's own (unchanged) length.
+        kept_tail = tail if insert else tail[1:]
+        rebuild = ([new_pattern] if new_pattern is not None else []) + list(kept_tail)
+        pos = position
+        for pattern in rebuild:
+            self._zynseq.add_pattern(bank, seq, 0, pos, pattern)
+            pos += self._libseq.getPatternLength(pattern)
         self._libseq.updateSequenceInfo()  # same post-add fixup note_on's own Paste branch uses
         self._chain_patterns = self._get_sequence_patterns(bank, seq, create=True)
-        self._libseq.selectPattern(pattern)
+        if new_pattern is not None:
+            self._libseq.selectPattern(new_pattern)
+            # chain_idx is exactly where new_pattern just landed - set
+            # self._arranger_current_idx directly rather than leaving
+            # it to refresh()'s own fallback (_arranger_sync_current_idx),
+            # which would land on new_pattern's *first* occurrence
+            # instead if it happens to already have twins elsewhere
+            # (e.g. replacing a slot with a palette pattern that's
+            # already placed somewhere else in the chain).
+            self._arranger_current_idx = chain_idx
         self.refresh()
+
+    def _arranger_add_pattern(self):
+        pattern = self._libseq.createPattern()
+        self._arranger_splice(len(self._chain_patterns), pattern)
         self._oled_value.show(f"Pattern {len(self._chain_patterns)} added")
 
     def _paint_column(self, step):
@@ -3062,6 +3556,19 @@ class StepSeqHandler(ModeHandlerBase):
             state = self._libseq.getPlayState(self._zynseq.bank, seq)
             if state in (zynseq.SEQ_PLAYING, zynseq.SEQ_STARTING, zynseq.SEQ_RESTARTING):
                 new_step = self._local_playhead_step(seq)
+                # None here means the playhead has moved out of the
+                # currently-focused pattern's own range (see
+                # _local_playhead_step's own comment) - in arranger
+                # mode, follow it to whichever chain pattern it's
+                # actually in now instead of just going blank, same
+                # "focus moves pattern to pattern as they play" APC
+                # behavior asked for directly, just driven by this
+                # same 200ms poll instead of a dedicated clock thread.
+                # Recompute immediately after switching so this tick
+                # still shows a playhead rather than waiting one more
+                # poll for it to reappear.
+                if new_step is None and self._arranger_mode and self._arranger_follow_playhead(seq):
+                    new_step = self._local_playhead_step(seq)
         if new_step == self._playhead_step:
             return
         old_step = self._playhead_step
@@ -3072,6 +3579,37 @@ class StepSeqHandler(ModeHandlerBase):
             self._paint_column(old_step)
         if new_step is not None:
             self._paint_column(new_step)
+
+    def _arranger_follow_playhead(self, seq):
+        """Finds whichever chain SLOT the raw playhead position is
+        actually inside right now, and switches focus to it
+        (_arranger_select_slot, the same thing a slot tap does) if
+        that's not already the focused slot - asked for directly:
+        "could we highlight the pattern that's currently playing in
+        arranger mode? ... in APC this just changes 'focus' of
+        patterns one by one as they are playing". Reuses
+        _arranger_select_slot rather than duplicating its own
+        selectPattern()+refresh() - refresh() repaints _paint_arranger
+        (so the new slot shows as COLOR_ARRANGER_CURRENT) and re-syncs
+        the real Arranger screen/Pattern Editor
+        (_arranger_sync_screen/_sync_pattern_editor) for free. Compares
+        by SLOT index, not pattern value, before delegating - the
+        playhead moving from one "twin" slot to another one sharing
+        the same pattern (_arranger_select_slot's own comment) is still
+        a real focus change _poll_playhead needs to know about, even
+        though getPatternIndex() itself wouldn't change. Returns True
+        if it actually switched, so _poll_playhead knows to recompute
+        this tick's playhead step against the new slot."""
+        raw_clocks = self._libseq.getPlayPosition(self._zynseq.bank, seq)
+        offset = 0
+        for idx, pattern in enumerate(self._chain_patterns):
+            length = self._libseq.getPatternLength(pattern)
+            if offset <= raw_clocks < offset + length:
+                switched = idx != self._arranger_current_idx
+                self._arranger_select_slot(idx)
+                return switched
+            offset += length
+        return False
 
     def _paint_pad(self, row, col):
         note_pad = _pad(row, col)
@@ -3114,6 +3652,31 @@ class StepSeqHandler(ModeHandlerBase):
         self._pads.set_pad(note_pad, *color)
 
     def _update_leds(self):
+        if self._arranger_mode:
+            # Solo1-4 mean something entirely different here (add/
+            # remove/paste/replace - see _arranger_note_on), so the
+            # normal mode's strip meaning (select-all level/mute/solo/
+            # quantize) would be actively misleading - asked for
+            # directly: "we could just use solo button led caps and
+            # clear the strip, I guess. Each have an armed action that
+            # should light up the cap". The strip (LED_SOLO_1-4) just
+            # goes dark; the button CAPS (LED_SOLO_1_BTN-4_BTN - the
+            # second, independent light on these buttons, see the plan
+            # doc's own "Solo 1-4 have TWO independent lights" entry)
+            # show which action is currently armed and waiting for a
+            # destination tap (self._arranger_pending_action) - bright
+            # for the armed one, dim for the other 3. Green-only family
+            # (LED_GREEN_DULL/HIGH, confirmed on hardware - no red
+            # available on this light).
+            for led in (LED_SOLO_1, LED_SOLO_2, LED_SOLO_3, LED_SOLO_4):
+                self._leds.led_off(led)
+            armed_led = {
+                "add": LED_SOLO_1_BTN, "remove": LED_SOLO_2_BTN,
+                "paste": LED_SOLO_3_BTN, "replace": LED_SOLO_4_BTN,
+            }.get(self._arranger_pending_action)
+            for led in (LED_SOLO_1_BTN, LED_SOLO_2_BTN, LED_SOLO_3_BTN, LED_SOLO_4_BTN):
+                self._leds.led_on(led, LED_GREEN_HIGH if led == armed_led else LED_GREEN_DULL)
+            return
         # Solo1's strip shows Alt+Solo1's own progressive select-all level
         # (see _select_all/_reset_select_all_level) - green for "visible",
         # red for "page", off once nothing select-all'd (including after
@@ -5523,13 +6086,15 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
                     # Screen-driven: change the actual screen; screen-follow
                     # (_update_current_handler) then updates the mode to
                     # match. Toggles between the two "performance" screens:
-                    # from mixer or StepSeq (pattern_editor - you got there
-                    # from zynpad in the first place, via BTN_STEP or
+                    # from mixer or StepSeq (pattern_editor, or arranger -
+                    # the StepSeq arranger overlay's own real-screen view,
+                    # see StepSeqHandler._arranger_set_screen - you got
+                    # there from zynpad in the first place, via BTN_STEP or
                     # Shift+Pad, so this reads as "go back"), go to zynpad;
                     # from anywhere else (including screens with no
                     # dedicated mode of their own), go to mixer - so repeated
                     # presses settle into alternating mixer <-> zynpad.
-                    if self._last_screen in ("audio_mixer", "pattern_editor"):
+                    if self._last_screen in ("audio_mixer", "pattern_editor", "arranger"):
                         self.state_manager.send_cuia("SCREEN_ZYNPAD")
                     else:
                         self.state_manager.send_cuia("SCREEN_AUDIO_MIXER")
@@ -5711,11 +6276,15 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         if btn == BTN_PLAY:
             if press_type == CONST.PT_BOLD:
                 self.state_manager.send_cuia("AUDIO_FILE_LIST")
+            elif self._current_handler is self._stepseq_handler and self._stepseq_handler._arranger_mode:
+                self._arranger_toggle_play()
             else:
                 self.state_manager.send_cuia("TOGGLE_PLAY")
         elif btn == BTN_STOP:
             if press_type == CONST.PT_BOLD:
                 self.state_manager.send_cuia("ALL_SOUNDS_OFF")
+            elif self._current_handler is self._stepseq_handler and self._stepseq_handler._arranger_mode:
+                self._arranger_stop_play()
             else:
                 self.state_manager.send_cuia("STOP")
         else:
@@ -5723,6 +6292,28 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
             if zynpot is not None:
                 letter = {CONST.PT_SHORT: 'S', CONST.PT_BOLD: 'B', CONST.PT_LONG: 'L'}[press_type]
                 self.state_manager.send_cuia("V5_ZYNPOT_SWITCH", [zynpot, letter])
+
+    def _arranger_toggle_play(self):
+        """Plain Play, while the StepSeq arranger overlay is both active
+        and actually on screen (_toggle_arranger_mode now sends
+        SCREEN_ARRANGER there) - TOGGLE_PLAY's own CUIA
+        (cuia_toggle_audio_play, zynthian_gui.py) only special-cases
+        current_screen == "pattern_editor"; any other screen, arranger
+        included, falls through to the generic audio-file-player
+        toggle instead of this sequence's own play/stop. Bypassing the
+        CUIA and driving libseq directly sidesteps that gap entirely -
+        the same thing the APC key25 mk2 driver's own arranger mode
+        already does unconditionally for Play, never going through a
+        CUIA for it at all."""
+        seq = self._stepseq_handler._get_selected_sequence()
+        self._stepseq_handler._libseq.togglePlayState(self._stepseq_handler._zynseq.bank, seq)
+
+    def _arranger_stop_play(self):
+        """Plain Stop's own equivalent of _arranger_toggle_play - same
+        CUIA gap (cuia_stop_audio_play)."""
+        seq = self._stepseq_handler._get_selected_sequence()
+        self._stepseq_handler._libseq.setPlayState(
+            self._stepseq_handler._zynseq.bank, seq, zynseq.SEQ_STOPPED)
 
     def _default_note_on(self, note):
         """Fallback for a note the current handler declined (returned
@@ -5824,6 +6415,21 @@ class zynthian_ctrldev_akai_fire(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zyn
         elif self._last_screen == "zynpad":
             self._set_current_handler(self._zynpad_handler)
         elif self._last_screen == "pattern_editor":
+            self._set_current_handler(self._stepseq_handler)
+        elif self._last_screen == "arranger":
+            # StepSeqHandler's own arranger overlay now switches the
+            # real screen to "arranger" too (_arranger_set_screen) -
+            # without this branch, screen-linking would hit the
+            # generic "no dedicated mode" case below and reset
+            # _knobs_handler to self._null_handler the moment that
+            # switch lands, breaking knob/Select routing while the
+            # overlay is showing (_set_current_handler no-ops here
+            # when _current_handler is already stepseq_handler, which
+            # it always already is by the time this fires from our own
+            # SCREEN_ARRANGER CUIA, so this is harmless/idempotent
+            # then - it only does real work if something *else*, e.g.
+            # the APC key25 mk2 driver's own arranger mode, switched
+            # to "arranger" first).
             self._set_current_handler(self._stepseq_handler)
         else:
             self._knobs_handler = self._null_handler
